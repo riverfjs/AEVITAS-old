@@ -1,85 +1,63 @@
 ---
 name: todoist
-description: Task management with due-date reminders and cron job scheduling. Use when user wants to add/list/complete tasks, set reminders, or manage recurring scheduled jobs (flight monitor, price checks, etc). Cron operations talk directly to aevitas gateway via WebSocket RPC.
+description: Manage tasks, reminders, and cron jobs through the todoist CLI. Use when the user asks to track tasks, set due-date reminders, or create recurring scheduled commands.
 ---
 
 # Todoist
 
-Manage tasks with reminders and schedule recurring/one-shot jobs through aevitas's cron engine.
+## Goal
 
-## Capabilities
+Provide a single command interface for task lifecycle and cron scheduling.
 
-- Add tasks with optional due dates
-- Reminder via cron 2 hours before due (delivered to Telegram)
-- Create recurring cron jobs that run shell commands and deliver output to Telegram
-- Trigger any cron job immediately on demand
-- List, delete, and manage all cron jobs
+## Hard Constraints
 
-## Implementation
-
-**Binary:** `~/.aevitas/workspace/.claude/skills/todoist/bin/todoist`
-
-### First run
-```bash
-bash ~/.aevitas/workspace/.claude/skills/todoist/scripts/bootstrap.sh
-```
-
-### Standard command entry
-```bash
-TODOIST=~/.aevitas/workspace/.claude/skills/todoist/bin/todoist
-$TODOIST <subcommand> ...
-```
-
-**Config:** `~/.aevitas/workspace/.claude/skills/todoist/config.json`
-```json
-{ "channel": "telegram", "chat_id": "<user-chat-id>" }
-```
-
-### Task commands
-```bash
-$TODOIST add "description"
-$TODOIST add "description" --due 2026-04-01
-$TODOIST list
-$TODOIST complete <id>
-$TODOIST delete <id>
-$TODOIST reminders          # show overdue tasks
-```
-
-### Cron commands (→ gateway ws://127.0.0.1:18790 via WS RPC)
-```bash
-$TODOIST cron-list                              # list all cron jobs and get job id
-$TODOIST cron-run <job-id>                      # trigger immediately
-$TODOIST cron-add "<name>" "<shell cmd>" <ms>   # add recurring job
-$TODOIST cron-delete <job-id>                   # delete a job
-```
-
-**Common intervals:**
-```
-1h  = 3600000    6h = 21600000    12h = 43200000    24h = 86400000
-```
-
-> `cron-run` is **async** — returns immediately after triggering. The result is delivered to Telegram by the gateway automatically. Do not run extra diagnostic commands unless the user explicitly asks.
-
-## Source layout
-
-```
-scripts/
-├── main.go      # CLI entry point, command dispatch
-├── todo.go      # Task / TodoList types and persistence
-├── cron.go      # CronJob types and CronManager (RPC calls)
-└── gateway.go   # WebSocket RPC client (callGateway)
-```
-
-## Rules
-
-- Always use `todoist` commands to manage cron jobs — never read or write `jobs.json` directly, never use `ls`/`cat` to inspect files
+- Always use `todoist` commands for task/cron operations; do not edit storage files directly.
 - `todoist cron-list` is the only correct way to list jobs
 - `todoist cron-run` accepts **job id only** (from `cron-list`), not job name
 - After `cron-run`, do not chain extra checks unless the user explicitly asks
+- Gateway must be running for cron commands to work.
 
-## Notes
+## Workflow
 
-- Gateway must be running for cron commands to work
-- `chat_id` in config enables Telegram delivery of cron results
-- Payload `kind: "command"` runs shell directly; `kind: "agentTurn"` runs agent with a prompt
-- Schedule kinds: `"every"` (interval), `"at"` (one-shot unix ms), `"cron"` (cron expr)
+1. Ensure bootstrap is done (first use):
+   - `bash ~/.aevitas/workspace/.claude/skills/todoist/scripts/bootstrap.sh`
+2. Use binary:
+   - `TODOIST=~/.aevitas/workspace/.claude/skills/todoist/bin/todoist`
+3. Task operations:
+   - `$TODOIST add "description" [--due YYYY-MM-DD]`
+   - `$TODOIST list`
+   - `$TODOIST complete <id>`
+   - `$TODOIST delete <id>`
+4. Cron operations:
+   - `$TODOIST cron-list`
+   - `$TODOIST cron-add "<name>" "<shell cmd>" <ms>`
+   - `$TODOIST cron-run <job-id>`
+   - `$TODOIST cron-delete <job-id>`
+5. Explain that `cron-run` is async and result will be delivered by gateway channel.
+
+Common intervals:
+- `1h=3600000`
+- `6h=21600000`
+- `12h=43200000`
+- `24h=86400000`
+
+## Output Template
+
+```markdown
+Action: <task|cron> <subcommand>
+Status: <success/failure>
+
+Details:
+- ID: <task-id or job-id>
+- Name/Description: <text>
+- Schedule/Due: <value if applicable>
+
+Next:
+- <suggested next command>
+```
+
+## When NOT to use this skill
+
+- User asks for full project planning workflows (not task CRUD/scheduling).
+- Task requires external PM platform APIs outside this local todoist CLI.
+- Gateway is unavailable and user does not want local-only fallback behavior.

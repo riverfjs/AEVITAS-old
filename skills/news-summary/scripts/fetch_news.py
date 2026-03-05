@@ -22,6 +22,16 @@ GROUPS = {
     "all": ["world", "top", "business", "tech", "reuters", "npr", "aljazeera"],
 }
 
+CATEGORY_HINTS = {
+    "world": "global affairs",
+    "top": "broad top headlines",
+    "business": "business and markets",
+    "tech": "technology industry",
+    "reuters": "Reuters world wire",
+    "npr": "NPR top stories",
+    "aljazeera": "Al Jazeera general feed",
+}
+
 
 def clean_text(raw: str) -> str:
     raw = re.sub(r"<[^>]+>", " ", raw or "")
@@ -91,7 +101,16 @@ def main():
     p.add_argument("--desc-len", type=int, default=180, help="Max description chars.")
     p.add_argument("--timeout", type=int, default=15, help="HTTP timeout seconds.")
     p.add_argument("--json", action="store_true", help="Output JSON instead of markdown.")
+    p.add_argument("--list-feeds", action="store_true", help="Print supported feed keys and groups, then exit.")
     args = p.parse_args()
+
+    if args.list_feeds:
+        payload = {
+            "groups": GROUPS,
+            "feeds": {k: {"url": FEEDS[k], "category": CATEGORY_HINTS.get(k, "")} for k in sorted(FEEDS.keys())},
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
 
     if args.feeds.strip():
         feed_keys = [x.strip().lower() for x in args.feeds.split(",") if x.strip()]

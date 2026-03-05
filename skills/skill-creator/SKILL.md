@@ -1,177 +1,146 @@
 ---
 name: skill-creator
-description: Create or update skills for aevitas. Use when user asks to create a new skill, add functionality, or when you need to package reusable scripts/workflows as a skill. Triggers on requests like "create a skill for X", "make a new skill", or when repeatedly writing similar code that should be packaged.
-allowed-tools:
-  - Write
-  - Edit
-  - Read
-  - Grep
-  - Glob
-  - Bash
-  - Task/TaskCreate/TaskGet/TaskList/TaskUpdate
+description: Create or update reusable skills for aevitas. Use when the user asks to build a new skill, refactor repeated workflows into a skill, or improve skill structure and SKILL.md quality.
 ---
 
 # Skill Creator
 
-Guide for creating effective skills in aevitas.
+Create high-quality, reusable skills for the aevitas runtime.
 
-## Core Principles
+## Before You Start: Gather Requirements
 
-1. **One file, one responsibility** — split by function, not by language
-2. **Self-contained** — handle own dependencies
-3. **Clear triggers** — description explains when to use
-4. **English only** — all SKILL.md files must be written in English
+Before creating a skill, gather:
 
-## Skill Structure
+1. Purpose and scope: what workflow should this skill solve?
+2. Trigger scenarios: when should the agent automatically use it?
+3. Target location: project skill or runtime workspace skill?
+4. Domain constraints: required tools, APIs, reliability constraints.
+5. Output style: report template, checklist, strict schema, etc.
+
+Use `AskUserQuestion` when requirements are ambiguous and discrete choices are needed.
+
+## Skill File Structure
+
+### Directory layout
 
 ```
-workspace/.claude/skills/skill-name/
-├── SKILL.md          required — metadata + docs (English)
-├── bin/              compiled binaries (Go skills)
-├── scripts/          executable source files
-│   ├── action-a.cjs  one action per file (Node.js)
-│   ├── action-b.cjs
-│   ├── main.go       CLI entry point only (Go)
-│   ├── feature-x.go  one domain per file (Go)
-│   └── feature-y.go
-└── data/             runtime data / state
+skill-name/
+├── SKILL.md            # required
+├── scripts/            # optional utility scripts
+├── bin/                # optional compiled binaries
+└── reference.md        # optional detailed docs
 ```
 
-## File Splitting Rule
+### Storage locations
 
-**One file = one concern.** Split by what the script does, not by language.
+Project skill:
+- `aevitas/skills/<skill-name>/`
 
-### Node.js example (browser skill)
-```
-scripts/
-├── start.cjs       # start browser
-├── stop.cjs        # stop browser
-├── nav.cjs         # navigate to URL
-├── eval.cjs        # run JavaScript in page
-└── screenshot.cjs  # capture screenshot
-```
+Runtime workspace skill:
+- `~/.aevitas/workspace/.claude/skills/<skill-name>/`
 
-### Go example (todoist skill)
-```
-scripts/
-├── main.go         # CLI entry point, command dispatch only
-├── todo.go         # Task / TodoList types + persistence
-├── cron.go         # CronJob types + CronManager
-└── gateway.go      # WebSocket RPC client
-```
+## SKILL.md Requirements
 
-### Shell example
-```
-scripts/
-├── check.sh        # check one thing
-├── monitor.sh      # orchestration (calls check.sh)
-└── notify.sh       # send notification
-```
+- Keep SKILL.md concise (prefer under 500 lines).
+- Frontmatter fields:
+  - `name`: lowercase letters, numbers, hyphens.
+  - `description`: include WHAT and WHEN.
+- Write SKILL.md in English for consistent triggering.
+- Favor deterministic workflows with explicit stop conditions.
 
-Never dump everything into a single `main.go` / `index.js` / `script.sh`.
+## Description Quality Rules
 
-## SKILL.md Template
+1. Use third-person style.
+2. Include trigger phrases users actually say.
+3. State both capability and usage moment.
+4. Avoid vague wording like "helper" or "utils".
+
+Good:
+- "Fetch and verify one specific news event with minimal tool calls. Use when user asks whether a specific claim is true or wants the latest update on one event."
+
+Bad:
+- "Helps with news."
+
+## Authoring Principles
+
+1. One file, one concern.
+2. Avoid unnecessary prose; keep instructions operational.
+3. Prefer a default path with explicit exceptions.
+4. Add hard constraints for expensive tools (search, browser, shell).
+5. Add stop conditions to prevent tool loops.
+
+## Recommended SKILL.md Sections
+
+1. Goal
+2. Hard constraints
+3. Workflow
+4. Output template
+5. When NOT to use this skill
+
+## Creation Workflow
+
+### Phase 1: Discovery
+
+- Clarify user intent and boundaries.
+- Capture tool budget and reliability requirements.
+- Identify overlap with existing skills.
+
+### Phase 2: Design
+
+- Choose a specific skill name.
+- Draft trigger-rich description.
+- Decide script/no-script approach.
+- Define success criteria and stop criteria.
+
+### Phase 3: Implementation
+
+- Create directory and SKILL.md.
+- Add optional scripts in `scripts/` only when needed.
+- Keep commands deterministic and reproducible.
+
+### Phase 4: Verification
+
+Checklist:
+
+- [ ] Name and description are specific.
+- [ ] Skill can be discovered by trigger terms.
+- [ ] Workflow has explicit stop conditions.
+- [ ] Tool usage limits are stated when applicable.
+- [ ] Terminology is consistent.
+- [ ] No platform-specific irrelevant constraints.
+
+## Anti-Patterns
+
+1. Multiple broad search loops without stop conditions.
+2. Huge SKILL.md with low-signal explanations.
+3. Mixing unrelated workflows in one skill.
+4. Missing "When NOT to use" section.
+5. Single giant script for many unrelated actions.
+
+## Minimal Template
 
 ```markdown
 ---
 name: skill-name
-description: WHAT it does and WHEN to use it. Be specific.
+description: Specific capability and trigger scenarios.
 ---
 
 # Skill Name
 
-One-sentence description.
+## Goal
+One clear objective.
 
-## Capabilities
+## Hard Constraints
+- Budget / safety / stop rules.
 
-- What users can ask for, in plain language
-- Another capability
+## Workflow
+1. Step one
+2. Step two
+3. Stop when condition met
 
-## Implementation
+## Output Template
+Required output structure.
 
-**Entry point:**
-` ` `bash
-~/.aevitas/workspace/.claude/skills/skill-name/bin/tool
-` ` `
-
-**Commands (grouped by concern):**
-` ` `bash
-# Group A
-tool action-a <arg>
-
-# Group B
-tool action-b <arg>
-` ` `
-
-**Source layout:**
-` ` `
-scripts/
-├── main.go    # what it does
-└── feature.go # what it does
-` ` `
-
-## Rules
-
-- Explicit constraints the agent must follow when using this skill
-- What NOT to do
-
-## Notes
-
-- Requirements, limitations, edge cases
-```
-
-**Language rules for SKILL.md:**
-- Capabilities: plain English, user-facing ("I can manage your tasks")
-- Implementation: exact commands the agent needs to run
-- Rules: hard constraints — what agent must and must not do
-
-## Creating a Skill
-
-### 1. Understand requirements
-- What does it do? When should the agent use it?
-
-### 2. Plan file layout
-Map each distinct action or domain to its own file before writing any code.
-
-### 3. Write scripts
-- Each file does exactly one thing
-- Use absolute paths (`$HOME/...`)
-- Make scripts executable: `chmod +x scripts/*.sh`
-
-### 4. Write SKILL.md (in English)
-- Frontmatter: `name` + `description`
-- Capabilities: plain English
-- Implementation: exact commands grouped by concern
-- Rules: explicit constraints on agent behavior
-- Source layout: brief file table
-
-### 5. Test & install
-```bash
-node scripts/start.cjs   # Node.js
-bash scripts/check.sh    # Shell
-go build -o bin/tool ./scripts/  # Go
-
-./aevitas skills install skill-name
-```
-
-## Build instructions by language
-
-**Node.js:** no build step; run directly with `node`
-
-**Go:**
-```bash
-cd skill-dir
-go mod init skill-name   # if no go.mod
-go get <dep>@latest
-go build -o bin/tool ./scripts/
-```
-
-**Shell:** `chmod +x` then run directly
-
-## Commands
-
-```bash
-./aevitas skills list           # list installed
-./aevitas skills install <name> # install skill
-./aevitas skills update <name>  # update skill
+## When NOT to use this skill
+- Boundary cases.
 ```
