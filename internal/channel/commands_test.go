@@ -86,7 +86,7 @@ func TestCommandHandler_HandleHelp(t *testing.T) {
 	if !contains(result.Response, "/start") || !contains(result.Response, "/reset") {
 		t.Errorf("Expected command list in response, got: %s", result.Response)
 	}
-	if !contains(result.Response, "/cleanup - Clean project temp files + .claude/voice/tts cache") {
+	if !contains(result.Response, "/cleanup - Clean temp/tts/var files") {
 		t.Errorf("Expected updated cleanup help text, got: %s", result.Response)
 	}
 }
@@ -363,7 +363,7 @@ func TestCommandHandler_HandleUsage_NoReporter(t *testing.T) {
 	}
 }
 
-func TestCommandHandler_CleanupScanIncludesTempAndTTS(t *testing.T) {
+func TestCommandHandler_CleanupScanIncludesTempTTSAndVar(t *testing.T) {
 	workspace := t.TempDir()
 	handler := NewCommandHandler(nil, workspace, 200000)
 
@@ -371,6 +371,7 @@ func TestCommandHandler_CleanupScanIncludesTempAndTTS(t *testing.T) {
 	tempScreenshot := filepath.Join(os.TempDir(), fmt.Sprintf("screenshot-%s.png", chatID))
 	nestedTempFile := filepath.Join(os.TempDir(), fmt.Sprintf("aevitas-%s", chatID), "agentsdk-nested.tmp")
 	ttsFile := filepath.Join(workspace, ".claude", "voice", "tts", "sample.mp3")
+	varFile := filepath.Join(workspace, "var", "python-conda-workspace", "work1", "generated.py")
 
 	if err := os.WriteFile(tempScreenshot, []byte("x"), 0644); err != nil {
 		t.Fatalf("failed to create temp screenshot: %v", err)
@@ -396,6 +397,14 @@ func TestCommandHandler_CleanupScanIncludesTempAndTTS(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(ttsFile) })
 
+	if err := os.MkdirAll(filepath.Dir(varFile), 0755); err != nil {
+		t.Fatalf("failed to create var dir: %v", err)
+	}
+	if err := os.WriteFile(varFile, []byte("print('ok')"), 0644); err != nil {
+		t.Fatalf("failed to create var file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(varFile) })
+
 	result := handler.handleCleanupScan(chatID)
 	if !result.Handled {
 		t.Fatal("expected cleanup scan to be handled")
@@ -420,6 +429,54 @@ func TestCommandHandler_CleanupScanIncludesTempAndTTS(t *testing.T) {
 	}
 	if !contains(list, ttsFile) {
 		t.Fatalf("cleanup list missing tts file: %s", list)
+	}
+	if !contains(list, varFile) {
+		t.Fatalf("cleanup list missing var file: %s", list)
+	}
+}
+
+func TestCommandHandler_CleanupConfirmScopeVar(t *testing.T) {
+	workspace := t.TempDir()
+	handler := NewCommandHandler(nil, workspace, 200000)
+	chatID := fmt.Sprintf("cleanup-scope-%d", os.Getpid())
+
+	ttsFile := filepath.Join(workspace, ".claude", "voice", "tts", "keep.mp3")
+	varFile := filepath.Join(workspace, "var", "python-conda-workspace", "work2", "delete.py")
+	if err := os.MkdirAll(filepath.Dir(ttsFile), 0755); err != nil {
+		t.Fatalf("mkdir tts dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(varFile), 0755); err != nil {
+		t.Fatalf("mkdir var dir: %v", err)
+	}
+	if err := os.WriteFile(ttsFile, []byte("audio"), 0644); err != nil {
+		t.Fatalf("write tts file: %v", err)
+	}
+	if err := os.WriteFile(varFile, []byte("print('x')"), 0644); err != nil {
+		t.Fatalf("write var file: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(ttsFile)
+		_ = os.Remove(varFile)
+		_ = os.Remove(filepath.Join(os.TempDir(), fmt.Sprintf("cleanup_%s.txt", chatID)))
+	})
+
+	scan := handler.handleCleanupScan(chatID)
+	if !scan.Handled {
+		t.Fatal("expected cleanup scan to be handled")
+	}
+
+	confirm := handler.handleCleanupConfirm(chatID, "var")
+	if !confirm.Handled {
+		t.Fatal("expected cleanup confirm to be handled")
+	}
+	if !contains(confirm.Response, "Scope: var") {
+		t.Fatalf("unexpected confirm response: %s", confirm.Response)
+	}
+	if _, err := os.Stat(varFile); !os.IsNotExist(err) {
+		t.Fatalf("expected var file deleted, got err=%v", err)
+	}
+	if _, err := os.Stat(ttsFile); err != nil {
+		t.Fatalf("expected tts file kept, stat err=%v", err)
 	}
 }
 

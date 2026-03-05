@@ -39,11 +39,13 @@ REMOTE_RELEASE="ffmpeg=${REMOTE_FFMPEG}|ffprobe=${REMOTE_FFPROBE}"
 
 if [ -x "${INSTALL_DIR}/ffmpeg" ] && [ -x "${INSTALL_DIR}/ffprobe" ]; then
   if [ -f "${STATE_FILE}" ] && [ "$(cat "${STATE_FILE}")" = "${REMOTE_RELEASE}" ]; then
+    echo "✓ ffmpeg tools already exist and are up-to-date, skip update"
     exit 0
   fi
   if [ ! -f "${STATE_FILE}" ]; then
     # Binaries already exist from previous installs; initialize fingerprint and skip.
     printf "%s" "${REMOTE_RELEASE}" > "${STATE_FILE}"
+    echo "✓ ffmpeg tools already exist; fingerprint initialized, skip update"
     exit 0
   fi
   UPDATE_MODE=1

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORK_ROOT="${HOME}/.aevitas/workspace/python-work"
+WORKSPACE_ROOT="${HOME}/.aevitas/workspace"
+WORK_ROOT="${HOME}/.aevitas/workspace/var/python-conda-workspace"
 WORK_NAME="${1:-}"
 
 if [ -z "${WORK_NAME}" ]; then

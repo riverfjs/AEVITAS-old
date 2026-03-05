@@ -95,6 +95,7 @@ It defines file-structure and SKILL.md writing standards.
 ### `python-conda-workspace`
 
 Standard Python execution skill with fixed Conda env `aevitas-workspace`.
+Generated helper scripts should be placed under `~/.aevitas/workspace/var/python-conda-workspace/<workname>/`.
 
 Main commands:
 
@@ -108,6 +109,8 @@ bash ~/.aevitas/workspace/.claude/skills/python-conda-workspace/scripts/install.
 bash ~/.aevitas/workspace/.claude/skills/python-conda-workspace/scripts/install.sh --work work1 --conda cairo
 bash ~/.aevitas/workspace/.claude/skills/python-conda-workspace/scripts/run.sh --work work1 --file main.py
 bash ~/.aevitas/workspace/.claude/skills/python-conda-workspace/scripts/clean.sh work1 --all
+# Optional cache cleanup for var artifacts:
+/cleanup confirm var
 ```
 
 ## Development Notes

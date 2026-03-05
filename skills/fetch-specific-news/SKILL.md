@@ -14,9 +14,12 @@ Get the latest status of one specific news event with strict search/fetch limits
 - For a single specific event/topic, use this skill instead of `news-summary`.
 - Do not run broad multi-round searching by default.
 - Default budget: `WebSearch` <= 1 call, `WebFetch` <= 2 calls.
+- Do not `WebFetch` the same URL repeatedly in one task.
+- `WebFetch` output is a bounded snippet; if detail is insufficient, switch to a better source URL instead of refetching the same page.
 - If evidence is already sufficient, stop and answer.
 - Only exceed budget when sources are clearly conflicting and user asks for deeper verification.
 - Absolute cap: `WebSearch` <= 2, `WebFetch` <= 3.
+- Example rule: If `https://example.com/news/123` was already fetched once in this task, do not fetch it again; fetch a different high-confidence source.
 
 ## Workflow
 
@@ -27,15 +30,16 @@ Get the latest status of one specific news event with strict search/fetch limits
    - location/org (if provided)
 2. Build one high-quality query first (not multiple variants).
 3. Run one `WebSearch` with focused terms and relevant source hints.
-4. Pick top high-confidence sources, then use `WebFetch` for details.
-5. Decide result status:
+4. Pick top high-confidence sources, then use `WebFetch` for details (prefer official page + one reputable media page).
+5. After each fetch, extract only claim-relevant facts and stop when evidence threshold is met; do not chain fetches by default.
+6. Decide result status:
    - `Confirmed`
    - `Likely true`
    - `Uncertain`
    - `Likely false`
    - `False`
-6. If confidence is low and sources conflict, run one final narrow `WebSearch` to break tie.
-7. Stop when either condition is met:
+7. If confidence is low and sources conflict, run one final narrow `WebSearch` to break tie.
+8. Stop when either condition is met:
    - official source + 1 reputable media source agree, or
    - 2 reputable media sources agree and no strong contradiction found.
 

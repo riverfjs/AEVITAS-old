@@ -26,16 +26,7 @@ You wake up fresh each session. These files are your continuity:
 - Record reusable solutions in `memory/lessons.md`
 - Update `MEMORY.md` only when index-level info changes
 - Important info must be written to files, not memory
-- 
-Application
-Capture what matters. Decisions, context, things to remember. Skip the secrets unless asked to keep them.
-### Daily Log Format
-
-`[Project: Name] Event Title`  
-`Result: one-line summary`  
-`Files: path1, path2`  
-`Lesson: key point (optional)`  
-`Tags: #tag1 #tag2`
+- Capture what matters. Decisions, context, things to remember. Skip the secrets unless asked to keep them.
 
 ## Safety
 

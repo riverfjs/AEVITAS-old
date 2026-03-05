@@ -3,7 +3,8 @@ set -euo pipefail
 
 ENV_NAME="aevitas-workspace"
 PY_VER="${PY_VER:-3.11}"
-WORK_ROOT="${HOME}/.aevitas/workspace/python-work"
+WORKSPACE_ROOT="${HOME}/.aevitas/workspace"
+WORK_ROOT="${HOME}/.aevitas/workspace/var/python-conda-workspace"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found in PATH"
@@ -29,3 +30,5 @@ echo "Upgrading pip/setuptools/wheel..."
 conda run -n "${ENV_NAME}" python -m pip install --upgrade pip setuptools wheel
 
 echo "Bootstrap complete: ${ENV_NAME}"
+echo "Workspace root: ${WORKSPACE_ROOT}"
+echo "Work root: ${WORK_ROOT}"

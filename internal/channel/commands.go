@@ -139,9 +139,23 @@ func (h *CommandHandler) HandleCommand(msg bus.InboundMessage) CommandResult {
 			Response: fmt.Sprintf("💬 **Your Chat Information**\n\nChannel: %s\nChat ID: `%s`\nSender ID: `%s`", msg.Channel, msg.ChatID, msg.SenderID),
 		}
 	case "/cleanup":
-		// Check if user is confirming previous cleanup request
-		if len(parts) > 1 && (strings.ToLower(parts[1]) == "confirm" || strings.ToLower(parts[1]) == "yes") {
-			return h.handleCleanupConfirm(msg.ChatID)
+		// Check if user is confirming previous cleanup request.
+		// Supported:
+		//   /cleanup confirm
+		//   /cleanup confirm all|temp|tts|var
+		//   /cleanup yes
+		if len(parts) > 1 {
+			sub := strings.ToLower(parts[1])
+			if sub == "yes" {
+				return h.handleCleanupConfirm(msg.ChatID, "all")
+			}
+			if sub == "confirm" {
+				scope := "all"
+				if len(parts) > 2 {
+					scope = strings.ToLower(strings.TrimSpace(parts[2]))
+				}
+				return h.handleCleanupConfirm(msg.ChatID, scope)
+			}
 		}
 		// Initial cleanup request - scan and show stats
 		return h.handleCleanupScan(msg.ChatID)
@@ -197,7 +211,7 @@ Use /skill list to see installed skills
 • /status - Show gateway status
 • /usage [total] - Show token usage (session or total)
 • /chatid - Show your chat ID
-• /cleanup - Clean project temp files + .claude/voice/tts cache (requires confirmation)
+• /cleanup - Clean temp/tts/var files (supports confirm all|temp|tts|var)
 
 **Multimodal:**
 Send images with text - I can analyze photos, diagrams, screenshots, etc.
@@ -456,11 +470,19 @@ func (h *CommandHandler) handleStatus() string {
 	return statusMsg
 }
 
-// handleCleanupScan scans for temporary screenshot files and shows statistics
+// handleCleanupScan scans for temporary files and shows statistics.
 func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
-	// Scan project temp files in common temp directories + workspace TTS cache.
+	type cleanupRecord struct {
+		scope string
+		path  string
+	}
+
+	// Scan project temp files in common temp directories + workspace TTS cache + workspace var.
 	var tempFiles []string
+	var records []cleanupRecord
 	var totalSize int64
+	var tempCount, ttsCount, varCount int
+	var tempSize, ttsSize, varSize int64
 
 	seen := map[string]struct{}{}
 	tempRoot := filepath.Clean(os.TempDir())
@@ -495,6 +517,9 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 				seen[file] = struct{}{}
 				tempFiles = append(tempFiles, file)
 				totalSize += info.Size()
+				records = append(records, cleanupRecord{scope: "temp", path: file})
+				tempCount++
+				tempSize += info.Size()
 			}
 		}
 	}
@@ -518,6 +543,9 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 		seen[path] = struct{}{}
 		tempFiles = append(tempFiles, path)
 		totalSize += info.Size()
+		records = append(records, cleanupRecord{scope: "temp", path: path})
+		tempCount++
+		tempSize += info.Size()
 		return nil
 	})
 
@@ -540,6 +568,34 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 			seen[path] = struct{}{}
 			tempFiles = append(tempFiles, path)
 			totalSize += info.Size()
+			records = append(records, cleanupRecord{scope: "tts", path: path})
+			ttsCount++
+			ttsSize += info.Size()
+			return nil
+		})
+	}
+
+	// Include workspace var artifacts (all files under var/) for deterministic cleanup.
+	varDir := ""
+	if h.workspace != "" {
+		varDir = filepath.Join(h.workspace, "var")
+	} else {
+		varDir = filepath.Join(os.Getenv("HOME"), ".aevitas", "workspace", "var")
+	}
+	if info, err := os.Stat(varDir); err == nil && info.IsDir() {
+		_ = filepath.Walk(varDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			if _, ok := seen[path]; ok {
+				return nil
+			}
+			seen[path] = struct{}{}
+			tempFiles = append(tempFiles, path)
+			totalSize += info.Size()
+			records = append(records, cleanupRecord{scope: "var", path: path})
+			varCount++
+			varSize += info.Size()
 			return nil
 		})
 	}
@@ -566,7 +622,11 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 	
 	// Save pending cleanup list to temp file
 	cleanupFile := filepath.Join(os.TempDir(), fmt.Sprintf("cleanup_%s.txt", chatID))
-	data := strings.Join(tempFiles, "\n")
+	var lines []string
+	for _, r := range records {
+		lines = append(lines, r.scope+"\t"+r.path)
+	}
+	data := strings.Join(lines, "\n")
 	if err := os.WriteFile(cleanupFile, []byte(data), 0644); err != nil {
 		return CommandResult{
 			Handled:  true,
@@ -579,10 +639,17 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 	response += "📊 Statistics:\n"
 	response += fmt.Sprintf("• Files: %d file(s)\n", len(tempFiles))
 	response += fmt.Sprintf("• Total Size: %.2f MB\n", float64(totalSize)/(1024*1024))
+	response += fmt.Sprintf("• temp: %d file(s), %.2f MB\n", tempCount, float64(tempSize)/(1024*1024))
+	response += fmt.Sprintf("• tts: %d file(s), %.2f MB\n", ttsCount, float64(ttsSize)/(1024*1024))
+	response += fmt.Sprintf("• var: %d file(s), %.2f MB\n", varCount, float64(varSize)/(1024*1024))
 	response += fmt.Sprintf("• Oldest: %s\n", utils.FormatRelativeTime(oldestTime))
 	response += fmt.Sprintf("• Newest: %s\n\n", utils.FormatRelativeTime(newestTime))
 	response += "⚠️ **Warning**: This action cannot be undone!\n\n"
-	response += "Reply with `/cleanup confirm` or `/cleanup yes` to delete these files."
+	response += "Reply with one option:\n"
+	response += "• `/cleanup confirm all` (or `/cleanup confirm` / `/cleanup yes`)\n"
+	response += "• `/cleanup confirm temp`\n"
+	response += "• `/cleanup confirm tts`\n"
+	response += "• `/cleanup confirm var`"
 	
 	return CommandResult{
 		Handled:  true,
@@ -590,8 +657,26 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 	}
 }
 
-// handleCleanupConfirm deletes the pending cleanup files
-func (h *CommandHandler) handleCleanupConfirm(chatID string) CommandResult {
+// handleCleanupConfirm deletes pending cleanup files by scope.
+func (h *CommandHandler) handleCleanupConfirm(chatID, scope string) CommandResult {
+	allowedScopes := map[string]bool{
+		"all":  true,
+		"temp": true,
+		"tts":  true,
+		"var":  true,
+		"":     true,
+	}
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if scope == "" {
+		scope = "all"
+	}
+	if !allowedScopes[scope] {
+		return CommandResult{
+			Handled:  true,
+			Response: "⚠️ Invalid cleanup scope. Use one of: `all`, `temp`, `tts`, `var`.",
+		}
+	}
+
 	// Load pending cleanup list
 	cleanupFile := filepath.Join(os.TempDir(), fmt.Sprintf("cleanup_%s.txt", chatID))
 	data, err := os.ReadFile(cleanupFile)
@@ -602,8 +687,33 @@ func (h *CommandHandler) handleCleanupConfirm(chatID string) CommandResult {
 		}
 	}
 	
-	tempFiles := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(tempFiles) == 0 {
+	rawLines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(rawLines) == 0 {
+		return CommandResult{
+			Handled:  true,
+			Response: "⚠️ No files to clean.",
+		}
+	}
+
+	type cleanupEntry struct {
+		scope string
+		path  string
+	}
+	var entries []cleanupEntry
+	for _, line := range rawLines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) == 2 {
+			entries = append(entries, cleanupEntry{scope: strings.TrimSpace(parts[0]), path: strings.TrimSpace(parts[1])})
+			continue
+		}
+		// Backward compatibility with older plain-path format.
+		entries = append(entries, cleanupEntry{scope: "temp", path: line})
+	}
+	if len(entries) == 0 {
 		return CommandResult{
 			Handled:  true,
 			Response: "⚠️ No files to clean.",
@@ -614,12 +724,15 @@ func (h *CommandHandler) handleCleanupConfirm(chatID string) CommandResult {
 	deletedCount := 0
 	var failedFiles []string
 	
-	for _, file := range tempFiles {
-		if file == "" {
+	for _, entry := range entries {
+		if entry.path == "" {
 			continue
 		}
-		if err := os.Remove(file); err != nil {
-			failedFiles = append(failedFiles, filepath.Base(file))
+		if scope != "all" && scope != entry.scope {
+			continue
+		}
+		if err := os.Remove(entry.path); err != nil {
+			failedFiles = append(failedFiles, filepath.Base(entry.path))
 		} else {
 			deletedCount++
 		}
@@ -629,7 +742,7 @@ func (h *CommandHandler) handleCleanupConfirm(chatID string) CommandResult {
 	os.Remove(cleanupFile)
 	
 	// Format response
-	response := fmt.Sprintf("✅ **Cleanup Complete**\n\nDeleted %d file(s)", deletedCount)
+	response := fmt.Sprintf("✅ **Cleanup Complete**\n\nScope: %s\nDeleted %d file(s)", scope, deletedCount)
 	if len(failedFiles) > 0 {
 		response += fmt.Sprintf("\n\n⚠️ Failed to delete %d file(s):\n%s", len(failedFiles), strings.Join(failedFiles, ", "))
 	}

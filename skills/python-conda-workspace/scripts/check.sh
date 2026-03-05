@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ENV_NAME="aevitas-workspace"
-WORK_ROOT="${HOME}/.aevitas/workspace/python-work"
+WORKSPACE_ROOT="${HOME}/.aevitas/workspace"
+WORK_ROOT="${HOME}/.aevitas/workspace/var/python-conda-workspace"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found in PATH"
@@ -26,7 +27,9 @@ echo "== pip =="
 conda run -n "${ENV_NAME}" python -m pip --version
 
 mkdir -p "${WORK_ROOT}"
-echo "== python-work =="
+echo "== workspace =="
+echo "${WORKSPACE_ROOT}"
+echo "== var/python-conda-workspace =="
 echo "${WORK_ROOT}"
 if [ -n "$(ls -A "${WORK_ROOT}" 2>/dev/null)" ]; then
   echo "projects:"

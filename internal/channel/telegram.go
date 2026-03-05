@@ -920,12 +920,12 @@ func (t *TelegramChannel) sendMediaFile(chatID int64, att api.Attachment) error 
 	return nil
 }
 
-// sendNewMessage sends a new message using full Telegramify pipeline
-// Supports text, code files, and Mermaid diagram images
+// sendNewMessage sends a new message using Telegramify pipeline for Telegram presentation.
+// Channel-agnostic Mermaid rendering should be handled by skill layer and sent as image attachments.
 func (t *TelegramChannel) sendNewMessage(chatID int64, content string, replyToMessageID int) error {
 	ctx := context.Background()
 	
-	// Process markdown with full pipeline (split, code extraction, mermaid rendering)
+	// Process markdown with full pipeline (split, code extraction, Telegram rendering)
 	const maxUTF16Len = 4090 // Leave some margin (Telegram limit is 4096)
 	contents, err := telegramify.Telegramify(ctx, content, maxUTF16Len, false, nil)
 	if err != nil {
@@ -1120,7 +1120,9 @@ func (t *TelegramChannel) sendFileContent(chatID int64, file *telegramify.File, 
 	return nil
 }
 
-// sendPhotoContent sends a photo (e.g., Mermaid diagram)
+// sendPhotoContent sends a photo attachment.
+// Mermaid cross-channel rendering is handled by skills (for example render-mermaid)
+// before the content reaches channel send logic.
 func (t *TelegramChannel) sendPhotoContent(chatID int64, photo *telegramify.Photo, replyToMessageID int) error {
 	// Create FileBytes from image data
 	fileBytes := tgbotapi.FileBytes{

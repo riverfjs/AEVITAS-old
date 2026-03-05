@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORK_ROOT="${HOME}/.aevitas/workspace/python-work"
+WORK_ROOT="${HOME}/.aevitas/workspace/var/python-conda-workspace"
 
 mkdir -p "${WORK_ROOT}"
 

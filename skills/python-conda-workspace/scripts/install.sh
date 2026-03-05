@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ENV_NAME="aevitas-workspace"
-WORK_ROOT="${HOME}/.aevitas/workspace/python-work"
+WORK_ROOT="${HOME}/.aevitas/workspace/var/python-conda-workspace"
 WORK_NAME=""
 MODE="pip"
 
