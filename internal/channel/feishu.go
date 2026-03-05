@@ -233,7 +233,10 @@ func (c *defaultFeishuClient) UploadFile(ctx context.Context, fileName string, d
 	if err != nil {
 		return "", err
 	}
-	fields := map[string]string{"file_type": "stream"}
+	fields := map[string]string{
+		"file_type": "stream",
+		"file_name": strings.TrimSpace(fileName),
+	}
 	respData, err := c.uploadMultipart(ctx, token, "https://open.feishu.cn/open-apis/im/v1/files", "file", fileName, data, fields)
 	if err != nil {
 		return "", err
@@ -260,6 +263,7 @@ func (c *defaultFeishuClient) UploadAudio(ctx context.Context, fileName string, 
 	}
 	fields := map[string]string{
 		"file_type": "opus",
+		"file_name": strings.TrimSpace(fileName),
 		"duration":  strconv.Itoa(durationMillis),
 	}
 	respData, err := c.uploadMultipart(ctx, token, "https://open.feishu.cn/open-apis/im/v1/files", "file", fileName, data, fields)
@@ -522,9 +526,7 @@ func (f *FeishuChannel) processInboundEvent(senderID, chatID, messageID, message
 	}
 	messageType = strings.ToLower(strings.TrimSpace(messageType))
 	content := ""
-	var media []string
-	mediaTypes := map[string]string{}
-	mediaMIMEs := map[string]string{}
+	var attachments []api.Attachment
 
 	switch messageType {
 	case "text":
@@ -538,36 +540,37 @@ func (f *FeishuChannel) processInboundEvent(senderID, chatID, messageID, message
 		content = strings.TrimSpace(textContent.Text)
 	case "image", "file", "audio":
 		if p, kind, mime, err := f.downloadInboundMedia(messageID, messageType, contentRaw); err == nil && p != "" {
-			media = append(media, p)
-			mediaTypes[p] = kind
-			mediaMIMEs[p] = mime
+			attachments = append(attachments, api.Attachment{
+				FilePath: p,
+				Type:     kind,
+				MimeType: mime,
+			})
 		} else if err != nil {
 			f.logger.Warnf("[feishu] download media failed: %v", err)
 		}
 	default:
 		return
 	}
-	if content == "" && len(media) == 0 {
+	if content == "" && len(attachments) == 0 {
 		return
 	}
 	meta := map[string]any{
 		"message_type": messageType,
 		"message_id":   strings.TrimSpace(messageID),
 	}
-	if len(mediaTypes) > 0 {
-		meta["media_types"] = mediaTypes
-	}
-	if len(mediaMIMEs) > 0 {
-		meta["media_mime_types"] = mediaMIMEs
+	media := make([]string, 0, len(attachments))
+	for _, att := range attachments {
+		media = append(media, att.FilePath)
 	}
 	f.bus.Inbound <- bus.InboundMessage{
-		Channel:   feishuChannelName,
-		SenderID:  senderID,
-		ChatID:    strings.TrimSpace(chatID),
-		Content:   content,
-		Media:     media,
-		Timestamp: time.Now(),
-		Metadata:  meta,
+		Channel:     feishuChannelName,
+		SenderID:    senderID,
+		ChatID:      strings.TrimSpace(chatID),
+		Content:     content,
+		Media:       media,
+		Attachments: attachments,
+		Timestamp:   time.Now(),
+		Metadata:    meta,
 	}
 }
 
@@ -594,11 +597,15 @@ func (f *FeishuChannel) Send(msg bus.OutboundMessage) error {
 		}
 	}
 
-	typeMap := mapStringMeta(msg.Metadata, "media_types")
-	mimeMap := mapStringMeta(msg.Metadata, "media_mime_types")
-	for _, mediaPath := range msg.Media {
-		if err := f.sendMediaPath(msg.ChatID, mediaPath, typeMap[mediaPath], mimeMap[mediaPath], rc); err != nil {
-			f.logger.Warnf("[feishu] send media failed path=%s err=%v", mediaPath, err)
+	attachments := msg.Attachments
+	if len(attachments) == 0 && len(msg.Media) > 0 {
+		for _, p := range msg.Media {
+			attachments = append(attachments, api.Attachment{FilePath: p})
+		}
+	}
+	for _, att := range attachments {
+		if err := f.sendMediaPath(msg.ChatID, att.FilePath, att.Type, att.MimeType, rc); err != nil {
+			f.logger.Warnf("[feishu] send media failed path=%s err=%v", att.FilePath, err)
 		}
 	}
 	if strings.TrimSpace(msg.Content) == "" {
@@ -1056,32 +1063,6 @@ func (f *FeishuChannel) downloadInboundMedia(messageID, messageType, contentRaw 
 		mime = api.DetectAttachmentMIME(explicitKind, localPath)
 	}
 	return localPath, explicitKind, mime, nil
-}
-
-func mapStringMeta(meta map[string]any, key string) map[string]string {
-	if len(meta) == 0 {
-		return nil
-	}
-	raw, ok := meta[key]
-	if !ok || raw == nil {
-		return nil
-	}
-	if typed, ok := raw.(map[string]string); ok {
-		return typed
-	}
-	generic, ok := raw.(map[string]any)
-	if !ok {
-		return nil
-	}
-	out := make(map[string]string, len(generic))
-	for k, v := range generic {
-		s, ok := v.(string)
-		if !ok {
-			continue
-		}
-		out[k] = s
-	}
-	return out
 }
 
 func encodeFeishuContent(msgType string, content map[string]string) (string, error) {

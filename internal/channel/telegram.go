@@ -20,6 +20,7 @@ import (
 	telegramify "github.com/riverfjs/telegramify-go"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	"github.com/riverfjs/agentsdk-go/pkg/api"
 )
 
 const telegramChannelName = "telegram"
@@ -209,8 +210,7 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 
 	// Download media if present
 	var media []string
-	mediaTypes := map[string]string{}
-	mediaMIMEs := map[string]string{}
+	var attachments []api.Attachment
 	if msg.Photo != nil && len(msg.Photo) > 0 {
 		// Get largest photo
 		photo := msg.Photo[len(msg.Photo)-1]
@@ -219,8 +219,11 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 			t.logger.Warnf("failed to download photo: %v", err)
 		} else {
 			media = append(media, localPath)
-			mediaTypes[localPath] = "image"
-			mediaMIMEs[localPath] = "image/jpeg"
+			attachments = append(attachments, api.Attachment{
+				FilePath: localPath,
+				Type:     "image",
+				MimeType: "image/jpeg",
+			})
 			t.logger.Debugf("downloaded photo to %s", localPath)
 		}
 	}
@@ -230,8 +233,11 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 			t.logger.Warnf("failed to download voice: %v", err)
 		} else {
 			media = append(media, localPath)
-			mediaTypes[localPath] = "audio"
-			mediaMIMEs[localPath] = strings.TrimSpace(msg.Voice.MimeType)
+			attachments = append(attachments, api.Attachment{
+				FilePath: localPath,
+				Type:     "audio",
+				MimeType: strings.TrimSpace(msg.Voice.MimeType),
+			})
 			t.logger.Debugf("downloaded voice to %s", localPath)
 		}
 	}
@@ -241,8 +247,11 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 			t.logger.Warnf("failed to download audio: %v", err)
 		} else {
 			media = append(media, localPath)
-			mediaTypes[localPath] = "audio"
-			mediaMIMEs[localPath] = strings.TrimSpace(msg.Audio.MimeType)
+			attachments = append(attachments, api.Attachment{
+				FilePath: localPath,
+				Type:     "audio",
+				MimeType: strings.TrimSpace(msg.Audio.MimeType),
+			})
 			t.logger.Debugf("downloaded audio to %s", localPath)
 		}
 	}
@@ -261,8 +270,11 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 				t.logger.Warnf("failed to download %s document: %v", kind, err)
 			} else {
 				media = append(media, localPath)
-				mediaTypes[localPath] = kind
-				mediaMIMEs[localPath] = mime
+				attachments = append(attachments, api.Attachment{
+					FilePath: localPath,
+					Type:     kind,
+					MimeType: mime,
+				})
 				t.logger.Debugf("downloaded %s document to %s", kind, localPath)
 			}
 		}
@@ -298,19 +310,18 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 	}()
 
 	t.bus.Inbound <- bus.InboundMessage{
-		Channel:   telegramChannelName,
-		SenderID:  senderID,
-		ChatID:    chatID,
-		Content:   content,
-		Media:     media,
-		Timestamp: time.Unix(int64(msg.Date), 0),
+		Channel:     telegramChannelName,
+		SenderID:    senderID,
+		ChatID:      chatID,
+		Content:     content,
+		Media:       media,
+		Attachments: attachments,
+		Timestamp:   time.Unix(int64(msg.Date), 0),
 		Metadata: map[string]any{
-			"username":         msg.From.UserName,
-			"first_name":       msg.From.FirstName,
-			"message_id":       msg.MessageID,
-			"stop_typing":      stopTyping, // Pass channel to gateway to stop typing
-			"media_types":      mediaTypes,
-			"media_mime_types": mediaMIMEs,
+			"username":    msg.From.UserName,
+			"first_name":  msg.From.FirstName,
+			"message_id":  msg.MessageID,
+			"stop_typing": stopTyping, // Pass channel to gateway to stop typing
 		},
 	}
 }
@@ -381,9 +392,15 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 	replyToMessageID := parseReplyToMessageID(msg.ReplyTo)
 
 	// Send media files first (if any)
-	for _, mediaPath := range msg.Media {
-		if err := t.sendMediaFile(chatID, mediaPath); err != nil {
-			t.logger.Warnf("failed to send media file %s: %v", mediaPath, err)
+	attachments := msg.Attachments
+	if len(attachments) == 0 && len(msg.Media) > 0 {
+		for _, p := range msg.Media {
+			attachments = append(attachments, api.Attachment{FilePath: p})
+		}
+	}
+	for _, att := range attachments {
+		if err := t.sendMediaFile(chatID, att); err != nil {
+			t.logger.Warnf("failed to send media file %s: %v", att.FilePath, err)
 			// Continue with other files
 		}
 	}
@@ -815,19 +832,23 @@ func (t *TelegramChannel) sendPhoto(chatID int64, imagePath string) error {
 }
 
 // sendMediaFile sends a file (document, image, etc.) to Telegram
-func (t *TelegramChannel) sendMediaFile(chatID int64, filePath string) error {
+func (t *TelegramChannel) sendMediaFile(chatID int64, att api.Attachment) error {
+	filePath := strings.TrimSpace(att.FilePath)
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return fmt.Errorf("media file not found: %s", filePath)
 	}
 
-	// Detect if it's an image or document
-	ext := strings.ToLower(filepath.Ext(filePath))
-	isImage := ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".webp"
-	isVoice := ext == ".ogg" || ext == ".opus"
-	isAudio := isVoice || ext == ".mp3" || ext == ".wav" || ext == ".m4a" || ext == ".aac" || ext == ".flac"
+	kind := strings.ToLower(strings.TrimSpace(att.Type))
+	if kind == "" {
+		mime := strings.TrimSpace(att.MimeType)
+		if mime == "" {
+			mime = strings.TrimSpace(api.DetectAttachmentMIME("", filePath))
+		}
+		kind = api.DetectAttachmentTypeFromMIME(mime)
+	}
 
-	if isImage {
+	if kind == "image" {
 		// Send as photo; fall back to document when Telegram rejects the image
 		// (e.g. PHOTO_INVALID_DIMENSIONS for very tall/wide screenshots).
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(filePath))
@@ -843,9 +864,10 @@ func (t *TelegramChannel) sendMediaFile(chatID int64, filePath string) error {
 		} else {
 			t.logger.Infof("sent photo to telegram chat_id=%d path=%s", chatID, filePath)
 		}
-	} else if isAudio {
+	} else if kind == "audio" {
 		voicePath := filePath
 		cleanupVoicePath := func() {}
+		isVoice := strings.HasSuffix(strings.ToLower(filePath), ".ogg") || strings.HasSuffix(strings.ToLower(filePath), ".opus")
 		if !isVoice {
 			convertedPath, convErr := transcodeToTelegramVoice(filePath)
 			if convErr != nil {
@@ -857,7 +879,6 @@ func (t *TelegramChannel) sendMediaFile(chatID int64, filePath string) error {
 			}
 		}
 		voice := tgbotapi.NewVoice(chatID, tgbotapi.FilePath(voicePath))
-		voice.Caption = filepath.Base(filePath)
 		if _, err := t.bot.Send(voice); err == nil {
 			cleanupVoicePath()
 			t.logger.Infof("sent voice to telegram chat_id=%d path=%s", chatID, filePath)

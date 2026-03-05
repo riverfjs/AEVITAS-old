@@ -420,15 +420,17 @@ func (g *Gateway) processLoop(ctx context.Context) {
 				}
 
 				meta := map[string]any{}
-				if msg.Channel == "telegram" && strings.TrimSpace(cmdResult.Event) != "" {
+				if strings.TrimSpace(cmdResult.Event) != "" {
 					meta[telegramEventKey] = strings.TrimSpace(cmdResult.Event)
 				}
+				cmdAttachments := buildBusAttachmentsFromPaths(cmdResult.Files)
 				outMsg := bus.OutboundMessage{
-					Channel:  msg.Channel,
-					ChatID:   msg.ChatID,
-					Content:  cmdResult.Response,
-					Media:    cmdResult.Files,
-					Metadata: meta,
+					Channel:     msg.Channel,
+					ChatID:      msg.ChatID,
+					Content:     cmdResult.Response,
+					Media:       cmdResult.Files,
+					Attachments: cmdAttachments,
+					Metadata:    meta,
 				}
 
 				if cmdResult.Restart {
@@ -469,7 +471,7 @@ func (g *Gateway) processLoop(ctx context.Context) {
 					continue
 				}
 
-				if outMsg.Content != "" || len(outMsg.Media) > 0 {
+				if outMsg.Content != "" || len(outMsg.Attachments) > 0 || len(outMsg.Media) > 0 {
 					g.bus.Outbound <- outMsg
 				}
 				continue
@@ -670,12 +672,21 @@ func (g *Gateway) deliverAgentResponse(msg bus.InboundMessage, resp *api.Respons
 	}
 
 	hookResult := g.processHookEvents(resp)
-	for _, filePath := range hookResult.sendFiles {
-		g.logger.Infof("[gateway] SendFile detected: %s", filePath)
+	for _, media := range hookResult.media {
+		g.logger.Infof("[gateway] SendFile detected: %s", media.path)
+		att := normalizeBusAttachment(api.Attachment{
+			FilePath: media.path,
+			Type:     media.kind,
+			MimeType: media.mime,
+		})
+		if att.FilePath == "" || att.Type == "" {
+			continue
+		}
 		g.bus.Outbound <- bus.OutboundMessage{
-			Channel: msg.Channel,
-			ChatID:  msg.ChatID,
-			Media:   []string{filePath},
+			Channel:     msg.Channel,
+			ChatID:      msg.ChatID,
+			Media:       []string{att.FilePath},
+			Attachments: []api.Attachment{att},
 		}
 	}
 
@@ -719,7 +730,7 @@ func (g *Gateway) deliverAgentResponse(msg bus.InboundMessage, resp *api.Respons
 			Content:  result,
 			Metadata: meta,
 		}
-	} else if len(hookResult.sendFiles) == 0 {
+	} else if len(hookResult.media) == 0 {
 		g.logger.Warnf("[gateway] no response generated for %s/%s", msg.Channel, msg.SenderID)
 	}
 
@@ -812,9 +823,16 @@ func usageThresholdMask(percent float64) uint8 {
 	return mask
 }
 
+type hookMedia struct {
+	path string
+	kind string
+	mime string
+	tool string
+}
+
 // hookEventResult holds all data extracted from a single pass over resp.HookEvents.
 type hookEventResult struct {
-	sendFiles    []string
+	media        []hookMedia
 	askQuestion  string
 	memoryNotice string
 }
@@ -880,7 +898,12 @@ func (g *Gateway) processHookEvents(resp *api.Response) hookEventResult {
 			toolName := strings.ToLower(strings.TrimSpace(payload.ToolName))
 			// Send explicit tool files and voice pipeline audio attachments.
 			if toolName == "sendfile" || toolName == "voice_tts" {
-				res.sendFiles = append(res.sendFiles, payload.FilePath)
+				res.media = append(res.media, hookMedia{
+					path: payload.FilePath,
+					kind: strings.ToLower(strings.TrimSpace(payload.Type)),
+					mime: strings.TrimSpace(payload.MimeType),
+					tool: toolName,
+				})
 			}
 		}
 	}
@@ -888,8 +911,8 @@ func (g *Gateway) processHookEvents(resp *api.Response) hookEventResult {
 	if len(toolNames) > 0 {
 		g.logger.Debugf("[gateway] PostToolUse: used %d tool(s): %v", len(toolNames), toolNames)
 	}
-	if len(res.sendFiles) > 0 {
-		g.logger.Infof("[gateway] Extracted %d file(s) from SendFile tool", len(res.sendFiles))
+	if len(res.media) > 0 {
+		g.logger.Infof("[gateway] Extracted %d file attachment(s) from hooks", len(res.media))
 	}
 
 	// Build memory notice
@@ -1078,56 +1101,62 @@ func formatProgressParams(raw string) string {
 }
 
 func buildAttachments(msg bus.InboundMessage) []api.Attachment {
-	if len(msg.Media) == 0 {
+	busAttachments := msg.Attachments
+	if len(busAttachments) == 0 && len(msg.Media) > 0 {
+		busAttachments = buildBusAttachmentsFromPaths(msg.Media)
+	}
+	if len(busAttachments) == 0 {
 		return nil
 	}
-	typeMap := mapStringFromMeta(msg.Metadata, "media_types")
-	mimeMap := mapStringFromMeta(msg.Metadata, "media_mime_types")
 
-	attachments := make([]api.Attachment, 0, len(msg.Media))
-	for _, mediaPath := range msg.Media {
-		if strings.TrimSpace(mediaPath) == "" {
+	attachments := make([]api.Attachment, 0, len(busAttachments))
+	for _, raw := range busAttachments {
+		att := normalizeBusAttachment(raw)
+		if att.FilePath == "" || att.Type == "" {
 			continue
-		}
-		attType := strings.ToLower(strings.TrimSpace(typeMap[mediaPath]))
-		switch attType {
-		case "image", "audio", "file":
-		default:
-			continue
-		}
-		mime := strings.TrimSpace(mimeMap[mediaPath])
-		if mime == "" {
-			mime = api.DetectAttachmentMIME(attType, mediaPath)
 		}
 		attachments = append(attachments, api.Attachment{
-			Type:     attType,
-			FilePath: mediaPath,
-			MimeType: mime,
+			Type:     att.Type,
+			FilePath: att.FilePath,
+			MimeType: att.MimeType,
 		})
 	}
 	return attachments
 }
 
-func mapStringFromMeta(meta map[string]any, key string) map[string]string {
-	if len(meta) == 0 {
-		return nil
-	}
-	raw, ok := meta[key]
-	if !ok || raw == nil {
-		return nil
-	}
-	if typed, ok := raw.(map[string]string); ok {
-		return typed
-	}
-	generic, ok := raw.(map[string]any)
-	if !ok {
-		return nil
-	}
-	out := make(map[string]string, len(generic))
-	for k, v := range generic {
-		if s, ok := v.(string); ok {
-			out[k] = s
+func buildBusAttachmentsFromPaths(paths []string) []api.Attachment {
+	out := make([]api.Attachment, 0, len(paths))
+	for _, path := range paths {
+		att := normalizeBusAttachment(api.Attachment{FilePath: path})
+		if att.FilePath == "" || att.Type == "" {
+			continue
 		}
+		out = append(out, att)
 	}
 	return out
+}
+
+func normalizeBusAttachment(att api.Attachment) api.Attachment {
+	path := strings.TrimSpace(att.FilePath)
+	if path == "" {
+		return api.Attachment{}
+	}
+	mime := strings.TrimSpace(att.MimeType)
+	if mime == "" {
+		mime = strings.TrimSpace(api.DetectAttachmentMIME("", path))
+	}
+	kind := strings.ToLower(strings.TrimSpace(att.Type))
+	if kind == "" {
+		kind = api.DetectAttachmentTypeFromMIME(mime)
+	}
+	switch kind {
+	case "image", "audio", "file":
+	default:
+		return api.Attachment{}
+	}
+	return api.Attachment{
+		FilePath: path,
+		Type:     kind,
+		MimeType: mime,
+	}
 }

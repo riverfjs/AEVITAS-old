@@ -58,7 +58,7 @@
     "tts": {
       "enabled": false,
       "provider": "edge",
-      "voice": "zh-CN-XiaoxiaoNeural",
+      "voice": "zh-CN-XiaoxiaoMultilingualNeural",
       "rate": "+0%",
       "volume": "+0%",
       "pitch": "+0Hz",

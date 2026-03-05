@@ -286,7 +286,7 @@ func DefaultConfig() *Config {
 			TTS: VoiceTTSConfig{
 				Enabled:    false,
 				Provider:   "edge",
-				Voice:      "zh-CN-XiaoxiaoNeural",
+				Voice:      "zh-CN-XiaoxiaoMultilingualNeural",
 				Rate:       "+0%",
 				Volume:     "+0%",
 				Pitch:      "+0Hz",

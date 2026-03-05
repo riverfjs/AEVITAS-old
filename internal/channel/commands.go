@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/usagehud"
@@ -295,7 +296,6 @@ func (h *CommandHandler) handleLogs(arg string) CommandResult {
 	if arg == "all" {
 		return CommandResult{
 			Handled:  true,
-			Response: "📄 **Gateway Logs (Full File)**\n\nSending complete log file...",
 			Files:    []string{logFile},
 		}
 	}
@@ -319,11 +319,24 @@ func (h *CommandHandler) handleLogs(arg string) CommandResult {
 		}
 	}
 	
-	response := fmt.Sprintf("📄 **Gateway Logs (Last %d lines)**\n\n```\n%s\n```", lines, content)
+	exportDir := filepath.Join(os.TempDir(), "aevitas-logs")
+	if err := os.MkdirAll(exportDir, 0755); err != nil {
+		return CommandResult{
+			Handled:  true,
+			Response: fmt.Sprintf("❌ Failed to prepare log export: %v", err),
+		}
+	}
+	exportPath := filepath.Join(exportDir, fmt.Sprintf("gateway-logs-last-%d-%d.txt", lines, time.Now().UnixNano()))
+	if err := os.WriteFile(exportPath, []byte(content+"\n"), 0644); err != nil {
+		return CommandResult{
+			Handled:  true,
+			Response: fmt.Sprintf("❌ Failed to write log export: %v", err),
+		}
+	}
 	
 	return CommandResult{
 		Handled:  true,
-		Response: response,
+		Files:    []string{exportPath},
 	}
 }
 

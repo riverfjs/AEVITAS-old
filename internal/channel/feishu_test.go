@@ -11,6 +11,7 @@ import (
 	"time"
 
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	"github.com/riverfjs/agentsdk-go/pkg/api"
 	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
@@ -359,10 +360,11 @@ func TestFeishuChannel_Send_MediaPathUsesMetadata(t *testing.T) {
 	err := ch.Send(bus.OutboundMessage{
 		ChatID: "oc_chat",
 		Media:  []string{p},
-		Metadata: map[string]any{
-			"media_types":      map[string]string{p: "image"},
-			"media_mime_types": map[string]string{p: "image/png"},
-		},
+		Attachments: []api.Attachment{{
+			FilePath: p,
+			Type:     "image",
+			MimeType: "image/png",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("send media error: %v", err)
@@ -389,10 +391,11 @@ func TestFeishuChannel_Send_AudioIncludesDuration(t *testing.T) {
 	err := ch.Send(bus.OutboundMessage{
 		ChatID: "oc_chat",
 		Media:  []string{p},
-		Metadata: map[string]any{
-			"media_types":      map[string]string{p: "audio"},
-			"media_mime_types": map[string]string{p: "audio/mpeg"},
-		},
+		Attachments: []api.Attachment{{
+			FilePath: p,
+			Type:     "audio",
+			MimeType: "audio/mpeg",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("send audio error: %v", err)
@@ -445,19 +448,15 @@ func TestFeishuChannel_ProcessInboundEvent_Image_MIMEFromAgentSDK(t *testing.T) 
 		if len(msg.Media) != 1 {
 			t.Fatalf("expected one media file, got %d", len(msg.Media))
 		}
-		typeMap, _ := msg.Metadata["media_types"].(map[string]string)
-		mimeMap, _ := msg.Metadata["media_mime_types"].(map[string]string)
-		if len(typeMap) != 1 || len(mimeMap) != 1 {
-			t.Fatalf("missing media metadata: %#v", msg.Metadata)
+		if len(msg.Attachments) != 1 {
+			t.Fatalf("expected one attachment, got %d", len(msg.Attachments))
 		}
-		for p, kind := range typeMap {
-			if kind != "image" {
-				t.Fatalf("kind = %q, want image", kind)
-			}
-			mime := mimeMap[p]
-			if !strings.HasPrefix(strings.ToLower(mime), "image/") {
-				t.Fatalf("mime = %q, want image/*", mime)
-			}
+		att := msg.Attachments[0]
+		if att.Type != "image" {
+			t.Fatalf("kind = %q, want image", att.Type)
+		}
+		if !strings.HasPrefix(strings.ToLower(att.MimeType), "image/") {
+			t.Fatalf("mime = %q, want image/*", att.MimeType)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expected inbound image")

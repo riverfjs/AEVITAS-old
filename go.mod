@@ -2,6 +2,8 @@ module github.com/riverfjs/aevitas
 
 go 1.24.0
 
+replace github.com/riverfjs/agentsdk-go => ../agentsdk-go
+
 require (
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
 	github.com/gorilla/websocket v1.5.3
