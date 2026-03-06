@@ -26,7 +26,7 @@ func NewProvider(cfg *config.Config) api.ModelFactory {
 	}
 }
 
-func BuildAPIOptions(cfg *config.Config, provider api.ModelFactory, sysPrompt string, log sdklogger.Logger, realtimeCallback func(api.RealtimeEvent)) api.Options {
+func BuildAPIOptions(cfg *config.Config, provider api.ModelFactory, sysPrompt string, log sdklogger.Logger, realtimeCallback func(api.RealtimeEvent), permissionHandler api.PermissionRequestHandler) api.Options {
 	inputGuardEnabled := cfg.Agent.Guard.InputEnabled
 	outputGuardEnabled := cfg.Agent.Guard.OutputEnabled
 	var promptGuardFactory api.ModelFactory
@@ -46,6 +46,7 @@ func BuildAPIOptions(cfg *config.Config, provider api.ModelFactory, sysPrompt st
 		HistoryLimit:            cfg.Agent.HistoryLimit,
 		TokenTracking:           cfg.Agent.TokenTracking.Enabled,
 		RealtimeEventCallback:   realtimeCallback,
+		PermissionRequestHandler: permissionHandler,
 		ProgressInterval:        cfg.Agent.ToolLog.Interval,
 		AutoRecall:              cfg.Agent.AutoRecall,
 		AutoRecallMaxResults:    cfg.Agent.AutoRecallMaxResults,

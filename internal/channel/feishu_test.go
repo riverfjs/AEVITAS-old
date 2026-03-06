@@ -10,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	"github.com/riverfjs/agentsdk-go/pkg/api"
 	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	"github.com/riverfjs/aevitas/internal/bus"
@@ -25,7 +26,7 @@ type mockFeishuAdvancedClient struct {
 	typedMessages []struct {
 		chatID  string
 		msgType string
-		content map[string]string
+		content string
 		replyTo string
 	}
 	editedTexts []struct {
@@ -43,7 +44,11 @@ type mockFeishuAdvancedClient struct {
 }
 
 func (m *mockFeishuAdvancedClient) SendMessage(ctx context.Context, chatID, content string) error {
-	_, err := m.SendTypedMessage(ctx, chatID, "text", map[string]string{"text": content}, "")
+	textContent, err := buildFeishuTextContent(content)
+	if err != nil {
+		return err
+	}
+	_, err = m.SendTypedMessage(ctx, chatID, larkim.MsgTypeText, textContent, "")
 	return err
 }
 
@@ -51,21 +56,26 @@ func (m *mockFeishuAdvancedClient) GetTenantAccessToken(ctx context.Context) (st
 	return "mock-token", nil
 }
 
-func (m *mockFeishuAdvancedClient) SendTypedMessage(ctx context.Context, chatID, msgType string, content map[string]string, replyTo string) (string, error) {
-	cp := map[string]string{}
-	for k, v := range content {
-		cp[k] = v
-	}
+func (m *mockFeishuAdvancedClient) SendTypedMessage(ctx context.Context, chatID, msgType, content, replyTo string) (string, error) {
 	m.typedMessages = append(m.typedMessages, struct {
 		chatID  string
 		msgType string
-		content map[string]string
+		content string
 		replyTo string
-	}{chatID: chatID, msgType: msgType, content: cp, replyTo: replyTo})
+	}{chatID: chatID, msgType: msgType, content: content, replyTo: replyTo})
 	if m.sendErr != nil {
 		return "", m.sendErr
 	}
 	return fmt.Sprintf("om_%d", len(m.typedMessages)), nil
+}
+
+func decodeFeishuContentField(t *testing.T, raw, field string) string {
+	t.Helper()
+	var payload map[string]string
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("decode feishu content: %v", err)
+	}
+	return strings.TrimSpace(payload[field])
 }
 
 func (m *mockFeishuAdvancedClient) EditTextMessage(ctx context.Context, messageID, text string) error {
@@ -182,7 +192,11 @@ func TestFeishuChannel_StartStop_LongConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new channel: %v", err)
 	}
-	ch.wsFactory = func(appID, appSecret string, onEvent func(context.Context, *larkevent.EventReq) error) (feishuWSClient, error) {
+	ch.wsFactory = func(
+		appID, appSecret string,
+		onEvent func(context.Context, *larkim.P2MessageReceiveV1) error,
+		onCardAction func(context.Context, *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error),
+	) (feishuWSClient, error) {
 		return mockWS, nil
 	}
 
@@ -229,8 +243,8 @@ func TestFeishuChannel_Send_ReplyToUserMessage(t *testing.T) {
 	if mockClient.typedMessages[0].replyTo != "om_user_1" {
 		t.Fatalf("replyTo = %q, want om_user_1", mockClient.typedMessages[0].replyTo)
 	}
-	if card, ok := mockClient.typedMessages[0].content["card"]; !ok || !json.Valid([]byte(card)) {
-		t.Fatalf("interactive content should carry valid card json, got=%q", card)
+	if !json.Valid([]byte(mockClient.typedMessages[0].content)) {
+		t.Fatalf("interactive content should carry valid card json, got=%q", mockClient.typedMessages[0].content)
 	}
 }
 
@@ -288,7 +302,7 @@ func TestFeishuChannel_Send_ToolProgressStandalone(t *testing.T) {
 	if mockClient.typedMessages[0].msgType != "interactive" {
 		t.Fatalf("expected tool block as interactive card, got %s", mockClient.typedMessages[0].msgType)
 	}
-	card := mockClient.typedMessages[0].content["card"]
+	card := mockClient.typedMessages[0].content
 	if !strings.Contains(card, `"tag":"markdown"`) {
 		t.Fatalf("expected tool card to use markdown element, got card=%s", card)
 	}
@@ -402,10 +416,10 @@ func TestFeishuChannel_Send_AudioIncludesDuration(t *testing.T) {
 	}
 	for _, m := range mockClient.typedMessages {
 		if m.msgType == "audio" {
-			if strings.TrimSpace(m.content["file_key"]) == "" {
+			if decodeFeishuContentField(t, m.content, "file_key") == "" {
 				t.Fatal("audio message missing file_key")
 			}
-			if _, ok := m.content["duration"]; ok {
+			if strings.Contains(m.content, `"duration"`) {
 				t.Fatal("audio message content should not include duration")
 			}
 			return
@@ -463,27 +477,24 @@ func TestFeishuChannel_ProcessInboundEvent_Image_MIMEFromAgentSDK(t *testing.T) 
 	}
 }
 
-func TestFeishuChannel_ProcessEventReq(t *testing.T) {
+func TestFeishuChannel_ProcessMessageReceiveEvent(t *testing.T) {
 	ch, b, _ := newFeishuWithMocks(t)
-	payload := map[string]any{
-		"header": map[string]any{
-			"event_type": "im.message.receive_v1",
-		},
-		"event": map[string]any{
-			"sender": map[string]any{
-				"sender_id": map[string]any{"open_id": "ou_test"},
+	ptr := func(v string) *string { return &v }
+	event := &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId: &larkim.UserId{OpenId: ptr("ou_test")},
 			},
-			"message": map[string]any{
-				"message_id":   "om_77",
-				"chat_id":      "oc_chat_77",
-				"message_type": "text",
-				"content":      `{"text":"hi"}`,
+			Message: &larkim.EventMessage{
+				MessageId:   ptr("om_77"),
+				ChatId:      ptr("oc_chat_77"),
+				MessageType: ptr("text"),
+				Content:     ptr(`{"text":"hi"}`),
 			},
 		},
 	}
-	body, _ := json.Marshal(payload)
-	if err := ch.processEventReq(context.Background(), &larkevent.EventReq{Body: body}); err != nil {
-		t.Fatalf("processEventReq error: %v", err)
+	if err := ch.processMessageReceiveEvent(context.Background(), event); err != nil {
+		t.Fatalf("processMessageReceiveEvent error: %v", err)
 	}
 	select {
 	case msg := <-b.Inbound:
@@ -495,31 +506,28 @@ func TestFeishuChannel_ProcessEventReq(t *testing.T) {
 	}
 }
 
-func TestEncodeFeishuContent_InteractiveUsesRawCardJSON(t *testing.T) {
+func TestBuildFeishuInteractiveContent_UsesRawCardJSON(t *testing.T) {
 	card := `{"config":{"wide_screen_mode":true},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"ok"}}]}`
-	got, err := encodeFeishuContent("interactive", map[string]string{"card": card})
+	got, err := buildFeishuInteractiveContent(card)
 	if err != nil {
-		t.Fatalf("encodeFeishuContent interactive error: %v", err)
+		t.Fatalf("buildFeishuInteractiveContent error: %v", err)
 	}
 	if got != card {
 		t.Fatalf("got %q, want raw card json %q", got, card)
 	}
 }
 
-func TestEncodeFeishuContent_InteractiveRejectsInvalidCard(t *testing.T) {
-	_, err := encodeFeishuContent("interactive", map[string]string{"card": "{bad json"})
+func TestBuildFeishuInteractiveContent_RejectsInvalidCard(t *testing.T) {
+	_, err := buildFeishuInteractiveContent("{bad json")
 	if err == nil {
 		t.Fatal("expected invalid card json error")
 	}
 }
 
-func TestEncodeFeishuContent_AudioUsesFileKeyOnly(t *testing.T) {
-	got, err := encodeFeishuContent("audio", map[string]string{
-		"file_key": "file_xxx",
-		"duration": "2345",
-	})
+func TestBuildFeishuAudioContent_UsesFileKeyOnly(t *testing.T) {
+	got, err := buildFeishuAudioContent("file_xxx")
 	if err != nil {
-		t.Fatalf("encodeFeishuContent audio error: %v", err)
+		t.Fatalf("buildFeishuAudioContent error: %v", err)
 	}
 	if !strings.Contains(got, `"file_key":"file_xxx"`) {
 		t.Fatalf("unexpected audio content json: %s", got)

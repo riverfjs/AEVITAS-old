@@ -6,24 +6,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
-	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkcard "github.com/larksuite/oapi-sdk-go/v3/card"
+	larkauth "github.com/larksuite/oapi-sdk-go/v3/service/auth/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkdispatcher "github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 	"github.com/riverfjs/agentsdk-go/pkg/api"
 	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	telegramify "github.com/riverfjs/telegramify-go"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	"github.com/tidwall/gjson"
 )
 
 const feishuChannelName = "feishu"
@@ -35,7 +37,7 @@ type FeishuClient interface {
 
 type feishuAdvancedClient interface {
 	FeishuClient
-	SendTypedMessage(ctx context.Context, chatID, msgType string, content map[string]string, replyTo string) (string, error)
+	SendTypedMessage(ctx context.Context, chatID, msgType, content string, replyTo string) (string, error)
 	EditTextMessage(ctx context.Context, messageID, text string) error
 	EditCardMessage(ctx context.Context, messageID, cardJSON string) error
 	DeleteMessage(ctx context.Context, messageID string) error
@@ -49,133 +51,179 @@ type feishuWSClient interface {
 	Start(ctx context.Context) error
 }
 
-type FeishuWSFactory func(appID, appSecret string, onEvent func(context.Context, *larkevent.EventReq) error) (feishuWSClient, error)
+type FeishuWSFactory func(
+	appID, appSecret string,
+	onEvent func(context.Context, *larkim.P2MessageReceiveV1) error,
+	onCardAction func(context.Context, *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error),
+) (feishuWSClient, error)
 
 type defaultFeishuClient struct {
 	appID     string
 	appSecret string
-	mu        sync.RWMutex
-	token     string
-	tokenExp  time.Time
+	sdk       *lark.Client
+}
+
+func buildFeishuTextContent(text string) (string, error) {
+	return larkim.NewTextMsgBuilder().Text(text).Build(), nil
+}
+
+func buildFeishuInteractiveContent(cardJSON string) (string, error) {
+	cardJSON = strings.TrimSpace(cardJSON)
+	if cardJSON == "" {
+		return "", fmt.Errorf("interactive content missing card")
+	}
+	if !json.Valid([]byte(cardJSON)) {
+		return "", fmt.Errorf("interactive card is not valid json")
+	}
+	return cardJSON, nil
+}
+
+func buildFeishuImageContent(imageKey string) (string, error) {
+	body, err := (&larkim.MessageImage{ImageKey: strings.TrimSpace(imageKey)}).String()
+	if err != nil {
+		return "", fmt.Errorf("marshal image content: %w", err)
+	}
+	return body, nil
+}
+
+func buildFeishuFileContent(fileKey string) (string, error) {
+	body, err := (&larkim.MessageFile{FileKey: strings.TrimSpace(fileKey)}).String()
+	if err != nil {
+		return "", fmt.Errorf("marshal file content: %w", err)
+	}
+	return body, nil
+}
+
+func buildFeishuAudioContent(fileKey string) (string, error) {
+	body, err := (&larkim.MessageAudio{FileKey: strings.TrimSpace(fileKey)}).String()
+	if err != nil {
+		return "", fmt.Errorf("marshal audio content: %w", err)
+	}
+	return body, nil
 }
 
 func (c *defaultFeishuClient) GetTenantAccessToken(ctx context.Context) (string, error) {
-	c.mu.RLock()
-	if c.token != "" && time.Now().Before(c.tokenExp) {
-		token := c.token
-		c.mu.RUnlock()
-		return token, nil
-	}
-	c.mu.RUnlock()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.token != "" && time.Now().Before(c.tokenExp) {
-		return c.token, nil
-	}
-
-	body := fmt.Sprintf(`{"app_id":"%s","app_secret":"%s"}`, c.appID, c.appSecret)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-		strings.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("create token request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
+	req := larkauth.NewInternalTenantAccessTokenReqBuilder().
+		Body(
+			larkauth.NewInternalTenantAccessTokenReqBodyBuilder().
+				AppId(c.appID).
+				AppSecret(c.appSecret).
+				Build(),
+		).
+		Build()
+	resp, err := c.sdk.Auth.V3.TenantAccessToken.Internal(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("get tenant token: %w", err)
 	}
-	defer resp.Body.Close()
+	if !resp.Success() {
+		return "", fmt.Errorf("feishu token error: %w", resp.CodeError)
+	}
 
-	var result struct {
-		Code              int    `json:"code"`
-		Msg               string `json:"msg"`
-		TenantAccessToken string `json:"tenant_access_token"`
-		Expire            int    `json:"expire"`
+	if resp.ApiResp == nil {
+		return "", fmt.Errorf("feishu token response missing raw body")
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode token response: %w", err)
+	token := strings.TrimSpace(gjson.GetBytes(resp.ApiResp.RawBody, "tenant_access_token").String())
+	if token == "" {
+		return "", fmt.Errorf("feishu token response missing tenant_access_token")
 	}
-	if result.Code != 0 {
-		return "", fmt.Errorf("feishu token error: %s", result.Msg)
-	}
-	c.token = result.TenantAccessToken
-	c.tokenExp = time.Now().Add(time.Duration(result.Expire-60) * time.Second)
-	return c.token, nil
+	return token, nil
 }
 
 func (c *defaultFeishuClient) SendMessage(ctx context.Context, chatID, content string) error {
-	_, err := c.SendTypedMessage(ctx, chatID, "text", map[string]string{"text": content}, "")
+	textContent, err := buildFeishuTextContent(content)
+	if err != nil {
+		return err
+	}
+	_, err = c.SendTypedMessage(ctx, chatID, larkim.MsgTypeText, textContent, "")
 	return err
 }
 
-func (c *defaultFeishuClient) SendTypedMessage(ctx context.Context, chatID, msgType string, content map[string]string, replyTo string) (string, error) {
-	token, err := c.GetTenantAccessToken(ctx)
-	if err != nil {
-		return "", err
+func (c *defaultFeishuClient) SendTypedMessage(ctx context.Context, chatID, msgType, content string, replyTo string) (string, error) {
+	msgType = strings.TrimSpace(msgType)
+	content = strings.TrimSpace(content)
+	if msgType == "" {
+		return "", fmt.Errorf("empty feishu message type")
 	}
-	contentStr, err := encodeFeishuContent(msgType, content)
-	if err != nil {
-		return "", err
-	}
-
-	var endpoint string
-	payload := map[string]any{
-		"msg_type": msgType,
-		"content":  contentStr,
+	if content == "" {
+		return "", fmt.Errorf("empty feishu message content")
 	}
 	if replyTo != "" {
-		endpoint = fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s/reply", replyTo)
-	} else {
-		endpoint = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
-		payload["receive_id"] = chatID
+		resp, err := c.sdk.Im.V1.Message.Reply(
+			ctx,
+			larkim.NewReplyMessageReqBuilder().
+				MessageId(strings.TrimSpace(replyTo)).
+				Body(
+					larkim.NewReplyMessageReqBodyBuilder().
+						Content(content).
+						MsgType(msgType).
+						Build(),
+				).
+				Build(),
+		)
+		if err != nil {
+			return "", fmt.Errorf("reply feishu message type=%s reply_to=%s: %w", msgType, strings.TrimSpace(replyTo), err)
+		}
+		if !resp.Success() {
+			return "", fmt.Errorf("reply feishu message type=%s reply_to=%s: %w", msgType, strings.TrimSpace(replyTo), resp.CodeError)
+		}
+		if resp.Data == nil {
+			return "", nil
+		}
+		return stringPtr(resp.Data.MessageId), nil
 	}
 
-	body, err := json.Marshal(payload)
+	resp, err := c.sdk.Im.V1.Message.Create(
+		ctx,
+		larkim.NewCreateMessageReqBuilder().
+			ReceiveIdType(larkim.ReceiveIdTypeChatId).
+			Body(
+				larkim.NewCreateMessageReqBodyBuilder().
+					ReceiveId(strings.TrimSpace(chatID)).
+					MsgType(msgType).
+					Content(content).
+					Build(),
+			).
+			Build(),
+	)
 	if err != nil {
-		return "", fmt.Errorf("marshal send payload: %w", err)
+		return "", fmt.Errorf("send feishu message type=%s chat_id=%s: %w", msgType, chatID, err)
 	}
-	resp, err := c.doJSON(ctx, token, http.MethodPost, endpoint, body)
-	if err != nil {
-		return "", fmt.Errorf("send feishu message type=%s chat_id=%s reply_to=%s: %w", msgType, chatID, strings.TrimSpace(replyTo), err)
+	if !resp.Success() {
+		return "", fmt.Errorf("send feishu message type=%s chat_id=%s: %w", msgType, chatID, resp.CodeError)
 	}
-	var out struct {
-		MessageID string `json:"message_id"`
+	if resp.Data == nil {
+		return "", nil
 	}
-	_ = json.Unmarshal(resp.Data, &out)
-	msgID := strings.TrimSpace(out.MessageID)
-	return msgID, nil
+	return stringPtr(resp.Data.MessageId), nil
 }
 
 func (c *defaultFeishuClient) EditTextMessage(ctx context.Context, messageID, text string) error {
-	token, err := c.GetTenantAccessToken(ctx)
-	if err != nil {
-		return err
-	}
-	contentJSON, err := json.Marshal(map[string]string{"text": text})
+	contentJSON, err := buildFeishuTextContent(text)
 	if err != nil {
 		return fmt.Errorf("marshal edit content: %w", err)
 	}
-	body, err := json.Marshal(map[string]any{
-		"msg_type": "text",
-		"content":  string(contentJSON),
-	})
+	resp, err := c.sdk.Im.V1.Message.Update(
+		ctx,
+		larkim.NewUpdateMessageReqBuilder().
+			MessageId(strings.TrimSpace(messageID)).
+			Body(
+				larkim.NewUpdateMessageReqBodyBuilder().
+						MsgType(larkim.MsgTypeText).
+						Content(contentJSON).
+					Build(),
+			).
+			Build(),
+	)
 	if err != nil {
-		return fmt.Errorf("marshal edit payload: %w", err)
+		return fmt.Errorf("edit text message: %w", err)
 	}
-	_, err = c.doJSON(ctx, token, http.MethodPut,
-		fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s", strings.TrimSpace(messageID)),
-		body)
-	return err
+	if !resp.Success() {
+		return fmt.Errorf("edit text message: %w", resp.CodeError)
+	}
+	return nil
 }
 
 func (c *defaultFeishuClient) EditCardMessage(ctx context.Context, messageID, cardJSON string) error {
-	token, err := c.GetTenantAccessToken(ctx)
-	if err != nil {
-		return err
-	}
 	cardJSON = strings.TrimSpace(cardJSON)
 	if cardJSON == "" {
 		return fmt.Errorf("empty card content")
@@ -183,229 +231,187 @@ func (c *defaultFeishuClient) EditCardMessage(ctx context.Context, messageID, ca
 	if !json.Valid([]byte(cardJSON)) {
 		return fmt.Errorf("invalid card json content")
 	}
-	body, err := json.Marshal(map[string]any{
-		"content": cardJSON,
-	})
+	resp, err := c.sdk.Im.V1.Message.Patch(
+		ctx,
+		larkim.NewPatchMessageReqBuilder().
+			MessageId(strings.TrimSpace(messageID)).
+			Body(
+				larkim.NewPatchMessageReqBodyBuilder().
+					Content(cardJSON).
+					Build(),
+			).
+			Build(),
+	)
 	if err != nil {
-		return fmt.Errorf("marshal card patch payload: %w", err)
+		return fmt.Errorf("edit card message: %w", err)
 	}
-	_, err = c.doJSON(ctx, token, http.MethodPatch,
-		fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s", strings.TrimSpace(messageID)),
-		body)
-	return err
+	if !resp.Success() {
+		return fmt.Errorf("edit card message: %w", resp.CodeError)
+	}
+	return nil
 }
 
 func (c *defaultFeishuClient) DeleteMessage(ctx context.Context, messageID string) error {
-	token, err := c.GetTenantAccessToken(ctx)
+	resp, err := c.sdk.Im.V1.Message.Delete(
+		ctx,
+		larkim.NewDeleteMessageReqBuilder().
+			MessageId(strings.TrimSpace(messageID)).
+			Build(),
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete message: %w", err)
 	}
-	_, err = c.doJSON(ctx, token, http.MethodDelete,
-		fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s", strings.TrimSpace(messageID)),
-		nil)
-	return err
+	if !resp.Success() {
+		return fmt.Errorf("delete message: %w", resp.CodeError)
+	}
+	return nil
 }
 
 func (c *defaultFeishuClient) UploadImage(ctx context.Context, fileName string, data []byte) (string, error) {
-	token, err := c.GetTenantAccessToken(ctx)
+	resp, err := c.sdk.Im.V1.Image.Create(
+		ctx,
+		larkim.NewCreateImageReqBuilder().
+			Body(
+				larkim.NewCreateImageReqBodyBuilder().
+					ImageType(larkim.ImageTypeMessage).
+					Image(bytes.NewReader(data)).
+					Build(),
+			).
+			Build(),
+	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("upload image: %w", err)
 	}
-	fields := map[string]string{"image_type": "message"}
-	respData, err := c.uploadMultipart(ctx, token, "https://open.feishu.cn/open-apis/im/v1/images", "image", fileName, data, fields)
-	if err != nil {
-		return "", err
+	if !resp.Success() {
+		return "", fmt.Errorf("upload image: %w", resp.CodeError)
 	}
-	var out struct {
-		ImageKey string `json:"image_key"`
+	imageKey := ""
+	if resp.Data != nil {
+		imageKey = stringPtr(resp.Data.ImageKey)
 	}
-	if err := json.Unmarshal(respData, &out); err != nil {
-		return "", fmt.Errorf("decode image upload response: %w", err)
-	}
-	if strings.TrimSpace(out.ImageKey) == "" {
+	if imageKey == "" {
 		return "", fmt.Errorf("empty image_key from feishu upload")
 	}
-	return out.ImageKey, nil
+	return imageKey, nil
 }
 
 func (c *defaultFeishuClient) UploadFile(ctx context.Context, fileName string, data []byte) (string, error) {
-	token, err := c.GetTenantAccessToken(ctx)
+	resp, err := c.sdk.Im.V1.File.Create(
+		ctx,
+		larkim.NewCreateFileReqBuilder().
+			Body(
+				larkim.NewCreateFileReqBodyBuilder().
+					FileType(larkim.FileTypeStream).
+					FileName(strings.TrimSpace(fileName)).
+					File(bytes.NewReader(data)).
+					Build(),
+			).
+			Build(),
+	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("upload file: %w", err)
 	}
-	fields := map[string]string{
-		"file_type": "stream",
-		"file_name": strings.TrimSpace(fileName),
+	if !resp.Success() {
+		return "", fmt.Errorf("upload file: %w", resp.CodeError)
 	}
-	respData, err := c.uploadMultipart(ctx, token, "https://open.feishu.cn/open-apis/im/v1/files", "file", fileName, data, fields)
-	if err != nil {
-		return "", err
+	fileKey := ""
+	if resp.Data != nil {
+		fileKey = stringPtr(resp.Data.FileKey)
 	}
-	var out struct {
-		FileKey string `json:"file_key"`
-	}
-	if err := json.Unmarshal(respData, &out); err != nil {
-		return "", fmt.Errorf("decode file upload response: %w", err)
-	}
-	if strings.TrimSpace(out.FileKey) == "" {
+	if fileKey == "" {
 		return "", fmt.Errorf("empty file_key from feishu upload")
 	}
-	return out.FileKey, nil
+	return fileKey, nil
 }
 
 func (c *defaultFeishuClient) UploadAudio(ctx context.Context, fileName string, data []byte, durationMillis int) (string, error) {
-	token, err := c.GetTenantAccessToken(ctx)
-	if err != nil {
-		return "", err
-	}
 	if durationMillis <= 0 {
 		durationMillis = audioDurationFallbackMillis
 	}
-	fields := map[string]string{
-		"file_type": "opus",
-		"file_name": strings.TrimSpace(fileName),
-		"duration":  strconv.Itoa(durationMillis),
-	}
-	respData, err := c.uploadMultipart(ctx, token, "https://open.feishu.cn/open-apis/im/v1/files", "file", fileName, data, fields)
+	resp, err := c.sdk.Im.V1.File.Create(
+		ctx,
+		larkim.NewCreateFileReqBuilder().
+			Body(
+				larkim.NewCreateFileReqBodyBuilder().
+					FileType(larkim.FileTypeOpus).
+					FileName(strings.TrimSpace(fileName)).
+					Duration(durationMillis).
+					File(bytes.NewReader(data)).
+					Build(),
+			).
+			Build(),
+	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("upload audio: %w", err)
 	}
-	var out struct {
-		FileKey string `json:"file_key"`
+	if !resp.Success() {
+		return "", fmt.Errorf("upload audio: %w", resp.CodeError)
 	}
-	if err := json.Unmarshal(respData, &out); err != nil {
-		return "", fmt.Errorf("decode audio upload response: %w", err)
+	fileKey := ""
+	if resp.Data != nil {
+		fileKey = stringPtr(resp.Data.FileKey)
 	}
-	if strings.TrimSpace(out.FileKey) == "" {
+	if fileKey == "" {
 		return "", fmt.Errorf("empty file_key from feishu audio upload")
 	}
-	return out.FileKey, nil
+	return fileKey, nil
 }
 
 func (c *defaultFeishuClient) DownloadResource(ctx context.Context, messageID, fileKey, resourceType string) ([]byte, string, error) {
-	token, err := c.GetTenantAccessToken(ctx)
-	if err != nil {
-		return nil, "", err
-	}
 	resourceType = strings.TrimSpace(resourceType)
 	if resourceType == "" {
 		resourceType = "file"
 	}
-	url := fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s/resources/%s?type=%s",
-		strings.TrimSpace(messageID), strings.TrimSpace(fileKey), resourceType)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("create download request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.sdk.Im.V1.MessageResource.Get(
+		ctx,
+		larkim.NewGetMessageResourceReqBuilder().
+			MessageId(strings.TrimSpace(messageID)).
+			FileKey(strings.TrimSpace(fileKey)).
+			Type(resourceType).
+			Build(),
+	)
 	if err != nil {
 		return nil, "", fmt.Errorf("download resource: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("download resource status=%d body=%s", resp.StatusCode, string(body))
+	if !resp.Success() {
+		return nil, "", fmt.Errorf("download resource: %w", resp.CodeError)
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.File)
 	if err != nil {
 		return nil, "", fmt.Errorf("read resource body: %w", err)
 	}
-	return data, strings.TrimSpace(resp.Header.Get("Content-Type")), nil
+	contentType := ""
+	if resp.ApiResp != nil && resp.ApiResp.Header != nil {
+		contentType = strings.TrimSpace(resp.ApiResp.Header.Get("Content-Type"))
+	}
+	return data, contentType, nil
 }
 
-type feishuJSONResponse struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
-}
-
-func (c *defaultFeishuClient) doJSON(ctx context.Context, token, method, endpoint string, body []byte) (*feishuJSONResponse, error) {
-	var reader io.Reader
-	if len(body) > 0 {
-		reader = bytes.NewReader(body)
+func stringPtr(v *string) string {
+	if v == nil {
+		return ""
 	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-	var out feishuJSONResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	if out.Code != 0 {
-		return nil, fmt.Errorf("feishu api error: %s", out.Msg)
-	}
-	return &out, nil
-}
-
-func (c *defaultFeishuClient) uploadMultipart(ctx context.Context, token, endpoint, fileField, fileName string, data []byte, fields map[string]string) (json.RawMessage, error) {
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	for k, v := range fields {
-		if err := w.WriteField(k, v); err != nil {
-			return nil, fmt.Errorf("write field %s: %w", k, err)
-		}
-	}
-	part, err := w.CreateFormFile(fileField, fileName)
-	if err != nil {
-		return nil, fmt.Errorf("create form file: %w", err)
-	}
-	if _, err := part.Write(data); err != nil {
-		return nil, fmt.Errorf("write form file: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("close multipart writer: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
-	if err != nil {
-		return nil, fmt.Errorf("create upload request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", w.FormDataContentType())
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("upload request: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read upload response: %w", err)
-	}
-	var out feishuJSONResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode upload response: %w", err)
-	}
-	if out.Code != 0 {
-		return nil, fmt.Errorf("feishu upload error: %s", out.Msg)
-	}
-	return out.Data, nil
+	return strings.TrimSpace(*v)
 }
 
 type FeishuClientFactory func(appID, appSecret string) FeishuClient
 
 var defaultFeishuClientFactory FeishuClientFactory = func(appID, appSecret string) FeishuClient {
-	return &defaultFeishuClient{appID: appID, appSecret: appSecret}
+	return &defaultFeishuClient{
+		appID:     appID,
+		appSecret: appSecret,
+		sdk:       lark.NewClient(appID, appSecret, lark.WithAppType(larkcore.AppTypeSelfBuilt)),
+	}
 }
 
-func defaultFeishuWSFactory(appID, appSecret string, onEvent func(context.Context, *larkevent.EventReq) error) (feishuWSClient, error) {
+func defaultFeishuWSFactory(
+	appID, appSecret string,
+	onEvent func(context.Context, *larkim.P2MessageReceiveV1) error,
+	onCardAction func(context.Context, *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error),
+) (feishuWSClient, error) {
 	handler := larkdispatcher.NewEventDispatcher("", "").
-		OnCustomizedEvent("im.message.receive_v1", onEvent)
+		OnP2MessageReceiveV1(onEvent).
+		OnP2CardActionTrigger(onCardAction)
 	client := larkws.NewClient(appID, appSecret,
 		larkws.WithEventHandler(handler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo))
@@ -457,7 +463,7 @@ func NewFeishuChannelWithFactory(cfg config.FeishuConfig, b *bus.MessageBus, fac
 
 func (f *FeishuChannel) Start(ctx context.Context) error {
 	f.client = f.clientFactory(f.cfg.AppID, f.cfg.AppSecret)
-	wsClient, err := f.wsFactory(f.cfg.AppID, f.cfg.AppSecret, f.processEventReq)
+	wsClient, err := f.wsFactory(f.cfg.AppID, f.cfg.AppSecret, f.processMessageReceiveEvent, f.processCardActionEvent)
 	if err != nil {
 		return fmt.Errorf("create feishu ws client: %w", err)
 	}
@@ -481,42 +487,80 @@ func (f *FeishuChannel) Stop() error {
 	return nil
 }
 
-func (f *FeishuChannel) processEventReq(ctx context.Context, req *larkevent.EventReq) error {
-	if req == nil || len(req.Body) == 0 {
+func (f *FeishuChannel) processMessageReceiveEvent(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+	if event == nil || event.Event == nil || event.Event.Message == nil {
 		return nil
 	}
-	var envelope struct {
-		Header struct {
-			EventType string `json:"event_type"`
-		} `json:"header"`
-		Event struct {
-			Sender struct {
-				SenderID struct {
-					OpenID string `json:"open_id"`
-				} `json:"sender_id"`
-			} `json:"sender"`
-			Message struct {
-				MessageID   string `json:"message_id"`
-				ChatID      string `json:"chat_id"`
-				MessageType string `json:"message_type"`
-				Content     string `json:"content"`
-			} `json:"message"`
-		} `json:"event"`
-	}
-	if err := json.Unmarshal(req.Body, &envelope); err != nil {
-		return fmt.Errorf("parse feishu event body: %w", err)
-	}
-	if strings.TrimSpace(envelope.Header.EventType) != "im.message.receive_v1" {
-		return nil
+	senderID := ""
+	if event.Event.Sender != nil && event.Event.Sender.SenderId != nil {
+		senderID = stringPtr(event.Event.Sender.SenderId.OpenId)
 	}
 	f.processInboundEvent(
-		envelope.Event.Sender.SenderID.OpenID,
-		envelope.Event.Message.ChatID,
-		envelope.Event.Message.MessageID,
-		envelope.Event.Message.MessageType,
-		envelope.Event.Message.Content,
+		senderID,
+		stringPtr(event.Event.Message.ChatId),
+		stringPtr(event.Event.Message.MessageId),
+		stringPtr(event.Event.Message.MessageType),
+		stringPtr(event.Event.Message.Content),
 	)
 	return nil
+}
+
+func (f *FeishuChannel) processEventReq(ctx context.Context, body []byte) error {
+	if len(body) == 0 {
+		return nil
+	}
+	var event larkim.P2MessageReceiveV1
+	if err := json.Unmarshal(body, &event); err != nil {
+		return fmt.Errorf("parse feishu event body: %w", err)
+	}
+	return f.processMessageReceiveEvent(ctx, &event)
+}
+
+func (f *FeishuChannel) processCardActionEvent(_ context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+	if event == nil || event.Event == nil || event.Event.Action == nil || event.Event.Context == nil {
+		return &callback.CardActionTriggerResponse{}, nil
+	}
+	action := ""
+	approvalID := ""
+	if event.Event.Action.Value != nil {
+		if v, ok := event.Event.Action.Value["approval_action"].(string); ok {
+			action = strings.ToLower(strings.TrimSpace(v))
+		}
+		if v, ok := event.Event.Action.Value["approval_id"].(string); ok {
+			approvalID = strings.TrimSpace(v)
+		}
+	}
+	if action != "allow" && action != "deny" {
+		return &callback.CardActionTriggerResponse{}, nil
+	}
+	chatID := strings.TrimSpace(event.Event.Context.OpenChatID)
+	if chatID == "" {
+		return &callback.CardActionTriggerResponse{}, nil
+	}
+	senderID := ""
+	if event.Event.Operator != nil {
+		senderID = strings.TrimSpace(event.Event.Operator.OpenID)
+	}
+	if senderID == "" || !f.IsAllowed(senderID) {
+		return &callback.CardActionTriggerResponse{}, nil
+	}
+	if rc, ok := f.client.(feishuAdvancedClient); ok {
+		if messageID := strings.TrimSpace(event.Event.Context.OpenMessageID); messageID != "" {
+			_ = rc.DeleteMessage(context.Background(), messageID)
+		}
+	}
+	f.bus.Inbound <- bus.InboundMessage{
+		Channel:   feishuChannelName,
+		SenderID:  senderID,
+		ChatID:    chatID,
+		Content:   "",
+		Timestamp: time.Now(),
+		Metadata: map[string]any{
+			"approval_action": action,
+			"approval_id":     approvalID,
+		},
+	}
+	return &callback.CardActionTriggerResponse{}, nil
 }
 
 func (f *FeishuChannel) processInboundEvent(senderID, chatID, messageID, messageType, contentRaw string) {
@@ -529,7 +573,7 @@ func (f *FeishuChannel) processInboundEvent(senderID, chatID, messageID, message
 	var attachments []api.Attachment
 
 	switch messageType {
-	case "text":
+	case larkim.MsgTypeText:
 		var textContent struct {
 			Text string `json:"text"`
 		}
@@ -538,7 +582,7 @@ func (f *FeishuChannel) processInboundEvent(senderID, chatID, messageID, message
 			return
 		}
 		content = strings.TrimSpace(textContent.Text)
-	case "image", "file", "audio":
+	case larkim.MsgTypeImage, larkim.MsgTypeFile, larkim.MsgTypeAudio:
 		if p, kind, mime, err := f.downloadInboundMedia(messageID, messageType, contentRaw); err == nil && p != "" {
 			attachments = append(attachments, api.Attachment{
 				FilePath: p,
@@ -584,6 +628,20 @@ func (f *FeishuChannel) Send(msg bus.OutboundMessage) error {
 	}
 
 	event := telegramEvent(msg.Metadata)
+	if msg.Metadata != nil {
+		if isApproval, _ := msg.Metadata["approval_prompt"].(bool); isApproval {
+			if strings.TrimSpace(msg.Content) != "" {
+				approvalID, _ := msg.Metadata["approval_id"].(string)
+				card := buildApprovalCardJSON(msg.Content, approvalID)
+				content, err := buildFeishuInteractiveContent(card)
+				if err != nil {
+					return err
+				}
+				_, err = rc.SendTypedMessage(context.Background(), msg.ChatID, larkim.MsgTypeInteractive, content, msg.ReplyTo)
+				return err
+			}
+		}
+	}
 	if msg.Content != "" {
 		switch event {
 		case telegramEventPreviewUpdate:
@@ -614,6 +672,39 @@ func (f *FeishuChannel) Send(msg bus.OutboundMessage) error {
 	return f.sendNewMessage(msg.ChatID, msg.Content, msg.ReplyTo, rc)
 }
 
+func buildApprovalCardJSON(text, approvalID string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "命令需要审批。"
+	}
+	approvalID = strings.TrimSpace(approvalID)
+	allowBtn := larkcard.NewMessageCardEmbedButton().
+		Text(larkcard.NewMessageCardPlainText().Content("允许").Build()).
+		Type(larkcard.MessageCardButtonTypePrimary).
+		Value(map[string]interface{}{
+			"approval_action": "allow",
+			"approval_id":     approvalID,
+		}).Build()
+	denyBtn := larkcard.NewMessageCardEmbedButton().
+		Text(larkcard.NewMessageCardPlainText().Content("拒绝").Build()).
+		Type(larkcard.MessageCardButtonTypeDanger).
+		Value(map[string]interface{}{
+			"approval_action": "deny",
+			"approval_id":     approvalID,
+		}).Build()
+	card := larkcard.NewMessageCard().
+		Config(larkcard.NewMessageCardConfig().WideScreenMode(true).Build()).
+		Elements([]larkcard.MessageCardElement{
+			larkcard.NewMessageCardMarkdown().Content(text).Build(),
+			larkcard.NewMessageCardAction().Actions([]larkcard.MessageCardActionElement{allowBtn, denyBtn}).Build(),
+		}).Build()
+	raw, err := card.JSON()
+	if err != nil {
+		return buildV2MarkdownCardJSON(text)
+	}
+	return raw
+}
+
 func (f *FeishuChannel) sendPreview(chatID, content, mode, replyTo string, rc feishuAdvancedClient) error {
 	if mode == "final" {
 		return f.finalizePreview(chatID, content, rc)
@@ -631,7 +722,11 @@ func (f *FeishuChannel) sendPreview(chatID, content, mode, replyTo string, rc fe
 	}
 	cardJSON := buildReplyCardJSON(text)
 	if err := rc.EditCardMessage(context.Background(), state.draftMessageID, cardJSON); err != nil {
-		newID, sendErr := rc.SendTypedMessage(context.Background(), chatID, "interactive", map[string]string{"card": cardJSON}, replyTo)
+		cardContent, contentErr := buildFeishuInteractiveContent(cardJSON)
+		if contentErr != nil {
+			return contentErr
+		}
+		newID, sendErr := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeInteractive, cardContent, replyTo)
 		if sendErr != nil {
 			return fmt.Errorf("edit preview: %w; fallback send: %v", err, sendErr)
 		}
@@ -706,7 +801,11 @@ func (f *FeishuChannel) applyFinalContents(chatID string, state feishuPreviewSta
 					continue
 				}
 			}
-			if _, err := rc.SendTypedMessage(context.Background(), chatID, "interactive", map[string]string{"card": cardJSON}, replyTo); err != nil {
+			cardContent, err := buildFeishuInteractiveContent(cardJSON)
+			if err != nil {
+				return err
+			}
+			if _, err := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeInteractive, cardContent, replyTo); err != nil {
 				return err
 			}
 			usedPreview = true
@@ -715,7 +814,11 @@ func (f *FeishuChannel) applyFinalContents(chatID string, state feishuPreviewSta
 			if err != nil {
 				return err
 			}
-			if _, err := rc.SendTypedMessage(context.Background(), chatID, "file", map[string]string{"file_key": fileKey}, replyTo); err != nil {
+			fileContent, err := buildFeishuFileContent(fileKey)
+			if err != nil {
+				return err
+			}
+			if _, err := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeFile, fileContent, replyTo); err != nil {
 				return err
 			}
 			usedPreview = true
@@ -724,7 +827,11 @@ func (f *FeishuChannel) applyFinalContents(chatID string, state feishuPreviewSta
 			if err != nil {
 				return err
 			}
-			if _, err := rc.SendTypedMessage(context.Background(), chatID, "image", map[string]string{"image_key": imageKey}, replyTo); err != nil {
+			imageContent, err := buildFeishuImageContent(imageKey)
+			if err != nil {
+				return err
+			}
+			if _, err := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeImage, imageContent, replyTo); err != nil {
 				return err
 			}
 			usedPreview = true
@@ -747,12 +854,20 @@ func (f *FeishuChannel) ensureTurnState(chatID, replyTo string, rc feishuAdvance
 		return state, nil
 	}
 	toolCard := buildToolCardJSON(formatFeishuToolBlock(1, nil))
-	toolID, err := rc.SendTypedMessage(context.Background(), chatID, "interactive", map[string]string{"card": toolCard}, "")
+	toolContent, err := buildFeishuInteractiveContent(toolCard)
+	if err != nil {
+		return feishuPreviewState{}, err
+	}
+	toolID, err := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeInteractive, toolContent, "")
 	if err != nil {
 		return feishuPreviewState{}, fmt.Errorf("send tool block: %w", err)
 	}
 	draftCard := buildReplyCardJSON("⌛ 正在生成回复...")
-	draftID, err := rc.SendTypedMessage(context.Background(), chatID, "interactive", map[string]string{"card": draftCard}, replyTo)
+	draftContent, err := buildFeishuInteractiveContent(draftCard)
+	if err != nil {
+		return feishuPreviewState{}, err
+	}
+	draftID, err := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeInteractive, draftContent, replyTo)
 	if err != nil {
 		return feishuPreviewState{}, fmt.Errorf("send draft block: %w", err)
 	}
@@ -783,7 +898,11 @@ func (f *FeishuChannel) sendToolProgress(chatID string, msg bus.OutboundMessage,
 		state.toolBlockIndex++
 		state.toolEntries = []toolEntry{entry}
 		newBlock := buildToolCardJSON(formatFeishuToolBlock(state.toolBlockIndex, state.toolEntries))
-		id, sendErr := rc.SendTypedMessage(context.Background(), chatID, "interactive", map[string]string{"card": newBlock}, "")
+		blockContent, contentErr := buildFeishuInteractiveContent(newBlock)
+		if contentErr != nil {
+			return contentErr
+		}
+		id, sendErr := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeInteractive, blockContent, "")
 		if sendErr != nil {
 			return fmt.Errorf("send tool block rollover: %w", sendErr)
 		}
@@ -812,7 +931,11 @@ func (f *FeishuChannel) sendStandaloneText(chatID, text string, rc feishuAdvance
 	if text == "" {
 		return nil
 	}
-	_, err := rc.SendTypedMessage(context.Background(), chatID, "text", map[string]string{"text": text}, "")
+	content, err := buildFeishuTextContent(text)
+	if err != nil {
+		return err
+	}
+	_, err = rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeText, content, "")
 	return err
 }
 
@@ -837,7 +960,11 @@ func (f *FeishuChannel) sendNewMessage(chatID, content, replyTo string, rc feish
 				continue
 			}
 			cardJSON := buildReplyCardJSON(text)
-			if _, err := rc.SendTypedMessage(ctx, chatID, "interactive", map[string]string{"card": cardJSON}, curReply); err != nil {
+			cardContent, err := buildFeishuInteractiveContent(cardJSON)
+			if err != nil {
+				return err
+			}
+			if _, err := rc.SendTypedMessage(ctx, chatID, larkim.MsgTypeInteractive, cardContent, curReply); err != nil {
 				return err
 			}
 		case *telegramify.File:
@@ -845,7 +972,11 @@ func (f *FeishuChannel) sendNewMessage(chatID, content, replyTo string, rc feish
 			if err != nil {
 				return err
 			}
-			if _, err := rc.SendTypedMessage(ctx, chatID, "file", map[string]string{"file_key": key}, curReply); err != nil {
+			fileContent, err := buildFeishuFileContent(key)
+			if err != nil {
+				return err
+			}
+			if _, err := rc.SendTypedMessage(ctx, chatID, larkim.MsgTypeFile, fileContent, curReply); err != nil {
 				return err
 			}
 		case *telegramify.Photo:
@@ -853,7 +984,11 @@ func (f *FeishuChannel) sendNewMessage(chatID, content, replyTo string, rc feish
 			if err != nil {
 				return err
 			}
-			if _, err := rc.SendTypedMessage(ctx, chatID, "image", map[string]string{"image_key": key}, curReply); err != nil {
+			imageContent, err := buildFeishuImageContent(key)
+			if err != nil {
+				return err
+			}
+			if _, err := rc.SendTypedMessage(ctx, chatID, larkim.MsgTypeImage, imageContent, curReply); err != nil {
 				return err
 			}
 		}
@@ -878,23 +1013,43 @@ func buildToolCardJSON(text string) string {
 }
 
 func buildV2MarkdownCardJSON(text string) string {
-	payload := map[string]any{
-		"config": map[string]any{
-			"wide_screen_mode": true,
-		},
-		"elements": []map[string]any{
+	type feishuCardConfig struct {
+		WideScreenMode bool `json:"wide_screen_mode"`
+	}
+	type feishuCardPlainText struct {
+		Tag     string `json:"tag"`
+		Content string `json:"content"`
+	}
+	type feishuCardElement struct {
+		Tag     string               `json:"tag"`
+		Content string               `json:"content,omitempty"`
+		Text    *feishuCardPlainText `json:"text,omitempty"`
+	}
+	type feishuCardPayload struct {
+		Config   feishuCardConfig   `json:"config,omitempty"`
+		Elements []feishuCardElement `json:"elements"`
+	}
+	payload := feishuCardPayload{
+		Config: feishuCardConfig{WideScreenMode: true},
+		Elements: []feishuCardElement{
 			{
-				"tag":     "markdown",
-				"content": text,
+				Tag:     "markdown",
+				Content: text,
 			},
 		},
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		// Fallback to plain text when markdown payload build fails.
-		fallback, _ := json.Marshal(map[string]any{
-			"elements": []map[string]any{
-				{"tag": "div", "text": map[string]string{"tag": "plain_text", "content": text}},
+		fallback, _ := json.Marshal(feishuCardPayload{
+			Elements: []feishuCardElement{
+				{
+					Tag: "div",
+					Text: &feishuCardPlainText{
+						Tag:     "plain_text",
+						Content: text,
+					},
+				},
 			},
 		})
 		return string(fallback)
@@ -960,14 +1115,18 @@ func (f *FeishuChannel) sendMediaPath(chatID, mediaPath, explicitType, explicitM
 	}
 	name := filepath.Base(mediaPath)
 	switch kind {
-	case "image":
+	case larkim.MsgTypeImage:
 		key, err := rc.UploadImage(context.Background(), name, data)
 		if err != nil {
 			return fmt.Errorf("upload image: %w", err)
 		}
-		_, err = rc.SendTypedMessage(context.Background(), chatID, "image", map[string]string{"image_key": key}, "")
+		imageContent, err := buildFeishuImageContent(key)
+		if err != nil {
+			return err
+		}
+		_, err = rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeImage, imageContent, "")
 		return err
-	case "audio":
+	case larkim.MsgTypeAudio:
 		audioPath := mediaPath
 		cleanupAudio := func() {}
 		if converted, convErr := transcodeToFeishuOpus(mediaPath); convErr != nil {
@@ -989,13 +1148,21 @@ func (f *FeishuChannel) sendMediaPath(chatID, mediaPath, explicitType, explicitM
 			cleanupAudio()
 			return fmt.Errorf("upload audio file: %w", err)
 		}
-		audioContent := map[string]string{"file_key": key}
-		_, err = rc.SendTypedMessage(context.Background(), chatID, "audio", audioContent, "")
+		audioContent, err := buildFeishuAudioContent(key)
+		if err != nil {
+			cleanupAudio()
+			return err
+		}
+		_, err = rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeAudio, audioContent, "")
 		cleanupAudio()
 		if err == nil {
 			return nil
 		}
-		_, err2 := rc.SendTypedMessage(context.Background(), chatID, "file", map[string]string{"file_key": key}, "")
+		fileContent, contentErr := buildFeishuFileContent(key)
+		if contentErr != nil {
+			return contentErr
+		}
+		_, err2 := rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeFile, fileContent, "")
 		if err2 != nil {
 			return fmt.Errorf("send audio/file fallback: %w / %v", err, err2)
 		}
@@ -1005,7 +1172,11 @@ func (f *FeishuChannel) sendMediaPath(chatID, mediaPath, explicitType, explicitM
 		if err != nil {
 			return fmt.Errorf("upload file: %w", err)
 		}
-		_, err = rc.SendTypedMessage(context.Background(), chatID, "file", map[string]string{"file_key": key}, "")
+		fileContent, err := buildFeishuFileContent(key)
+		if err != nil {
+			return err
+		}
+		_, err = rc.SendTypedMessage(context.Background(), chatID, larkim.MsgTypeFile, fileContent, "")
 		return err
 	}
 }
@@ -1015,32 +1186,32 @@ func (f *FeishuChannel) downloadInboundMedia(messageID, messageType, contentRaw 
 	if !ok {
 		return "", "", "", fmt.Errorf("advanced feishu client unavailable")
 	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(contentRaw), &payload); err != nil {
-		return "", "", "", fmt.Errorf("parse media content: %w", err)
-	}
 	fileKey := ""
-	resourceType := "file"
+	resourceType := larkim.MsgTypeFile
 	explicitKind := ""
 	switch strings.ToLower(strings.TrimSpace(messageType)) {
-	case "image":
-		if v, ok := payload["image_key"].(string); ok {
-			fileKey = strings.TrimSpace(v)
+	case larkim.MsgTypeImage:
+		var payload larkim.MessageImage
+		if err := json.Unmarshal([]byte(contentRaw), &payload); err != nil {
+			return "", "", "", fmt.Errorf("parse media content: %w", err)
 		}
-		resourceType = "image"
-		explicitKind = "image"
-	case "audio":
-		if v, ok := payload["file_key"].(string); ok {
-			fileKey = strings.TrimSpace(v)
+		fileKey = strings.TrimSpace(payload.ImageKey)
+		resourceType = larkim.MsgTypeImage
+		explicitKind = larkim.MsgTypeImage
+	case larkim.MsgTypeAudio:
+		var payload larkim.MessageAudio
+		if err := json.Unmarshal([]byte(contentRaw), &payload); err != nil {
+			return "", "", "", fmt.Errorf("parse media content: %w", err)
 		}
-		resourceType = "file"
-		explicitKind = "audio"
+		fileKey = strings.TrimSpace(payload.FileKey)
+		explicitKind = larkim.MsgTypeAudio
 	default:
-		if v, ok := payload["file_key"].(string); ok {
-			fileKey = strings.TrimSpace(v)
+		var payload larkim.MessageFile
+		if err := json.Unmarshal([]byte(contentRaw), &payload); err != nil {
+			return "", "", "", fmt.Errorf("parse media content: %w", err)
 		}
-		resourceType = "file"
-		explicitKind = "file"
+		fileKey = strings.TrimSpace(payload.FileKey)
+		explicitKind = larkim.MsgTypeFile
 	}
 	if fileKey == "" {
 		return "", "", "", fmt.Errorf("empty media key")
@@ -1065,47 +1236,3 @@ func (f *FeishuChannel) downloadInboundMedia(messageID, messageType, contentRaw 
 	return localPath, explicitKind, mime, nil
 }
 
-func encodeFeishuContent(msgType string, content map[string]string) (string, error) {
-	msgType = strings.ToLower(strings.TrimSpace(msgType))
-	switch msgType {
-	case "interactive":
-		card := strings.TrimSpace(content["card"])
-		if card == "" {
-			return "", fmt.Errorf("interactive content missing card")
-		}
-		if !json.Valid([]byte(card)) {
-			return "", fmt.Errorf("interactive card is not valid json")
-		}
-		return card, nil
-	case "text":
-		b, err := json.Marshal(map[string]string{"text": content["text"]})
-		if err != nil {
-			return "", fmt.Errorf("marshal text content: %w", err)
-		}
-		return string(b), nil
-	case "image":
-		b, err := json.Marshal(map[string]string{"image_key": content["image_key"]})
-		if err != nil {
-			return "", fmt.Errorf("marshal image content: %w", err)
-		}
-		return string(b), nil
-	case "file":
-		b, err := json.Marshal(map[string]string{"file_key": content["file_key"]})
-		if err != nil {
-			return "", fmt.Errorf("marshal file/audio content: %w", err)
-		}
-		return string(b), nil
-	case "audio":
-		b, err := json.Marshal(map[string]string{"file_key": content["file_key"]})
-		if err != nil {
-			return "", fmt.Errorf("marshal audio content: %w", err)
-		}
-		return string(b), nil
-	default:
-		b, err := json.Marshal(content)
-		if err != nil {
-			return "", fmt.Errorf("marshal generic content: %w", err)
-		}
-		return string(b), nil
-	}
-}

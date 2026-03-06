@@ -181,10 +181,13 @@ func (t *TelegramChannel) Start(ctx context.Context) error {
 		for {
 			select {
 			case update := <-updates:
-				if update.Message == nil {
+				if update.CallbackQuery != nil {
+					t.handleCallbackQuery(update.CallbackQuery)
 					continue
 				}
-				t.handleMessage(update.Message)
+				if update.Message != nil {
+					t.handleMessage(update.Message)
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -326,6 +329,34 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 	}
 }
 
+func (t *TelegramChannel) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
+	if cb == nil || cb.From == nil || cb.Message == nil {
+		return
+	}
+	senderID := strconv.FormatInt(cb.From.ID, 10)
+	if !t.IsAllowed(senderID) {
+		return
+	}
+	action, approvalID, ok := parseApprovalCallbackData(cb.Data)
+	if !ok {
+		return
+	}
+	chatID := strconv.FormatInt(cb.Message.Chat.ID, 10)
+	_ = t.bot.DeleteMessage(cb.Message.Chat.ID, cb.Message.MessageID)
+	t.bus.Inbound <- bus.InboundMessage{
+		Channel:   telegramChannelName,
+		SenderID:  senderID,
+		ChatID:    chatID,
+		Content:   "",
+		Timestamp: time.Now(),
+		Metadata: map[string]any{
+			"approval_action": action,
+			"approval_id":     approvalID,
+			"message_id":      cb.Message.MessageID,
+		},
+	}
+}
+
 func (t *TelegramChannel) Stop() error {
 	if t.cancel != nil {
 		t.cancel()
@@ -407,6 +438,13 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 
 	// Send text content if present
 	if msg.Content != "" {
+		if msg.Metadata != nil {
+			if isApproval, _ := msg.Metadata["approval_prompt"].(bool); isApproval {
+				if approvalID, _ := msg.Metadata["approval_id"].(string); strings.TrimSpace(approvalID) != "" {
+					return t.sendApprovalPrompt(chatID, msg.Content, approvalID)
+				}
+			}
+		}
 		switch event {
 		case telegramEventPreviewUpdate:
 			return t.sendPreview(chatID, msg.Content, "update", replyToMessageID)
@@ -421,6 +459,36 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 	}
 
 	return nil
+}
+
+func (t *TelegramChannel) sendApprovalPrompt(chatID int64, content string, approvalID string) error {
+	msg := tgbotapi.NewMessage(chatID, truncateTelegramText(content, 4000))
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ 允许", "approval:allow:"+approvalID),
+			tgbotapi.NewInlineKeyboardButtonData("❌ 拒绝", "approval:deny:"+approvalID),
+		),
+	)
+	_, err := t.bot.Send(msg)
+	return err
+}
+
+func parseApprovalCallbackData(data string) (action string, approvalID string, ok bool) {
+	parts := strings.Split(strings.TrimSpace(data), ":")
+	if len(parts) != 3 || parts[0] != "approval" {
+		return "", "", false
+	}
+	act := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch act {
+	case "allow", "deny":
+	default:
+		return "", "", false
+	}
+	id := strings.TrimSpace(parts[2])
+	if id == "" {
+		return "", "", false
+	}
+	return act, id, true
 }
 
 func telegramEvent(meta map[string]any) string {

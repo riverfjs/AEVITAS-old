@@ -77,6 +77,10 @@ type Options struct {
 
 // DefaultRuntimeFactory creates the default agentsdk-go runtime
 func DefaultRuntimeFactory(cfg *config.Config, sysPrompt string, realtimeCallback func(api.RealtimeEvent)) (Runtime, error) {
+	return defaultRuntimeFactoryWithPermissions(cfg, sysPrompt, realtimeCallback, nil)
+}
+
+func defaultRuntimeFactoryWithPermissions(cfg *config.Config, sysPrompt string, realtimeCallback func(api.RealtimeEvent), permissionHandler api.PermissionRequestHandler) (Runtime, error) {
 	// 初始化 logger - 默认启用 debug 日志
 	debug := true // 始终启用详细日志
 	zapLogger, err := logger.InitLogger(cfg.Agent.Workspace, debug)
@@ -86,7 +90,7 @@ func DefaultRuntimeFactory(cfg *config.Config, sysPrompt string, realtimeCallbac
 	sdkLog := sdklogger.NewZapLogger(zapLogger)
 
 	provider := runtimeopts.NewProvider(cfg)
-	rt, err := api.New(context.Background(), runtimeopts.BuildAPIOptions(cfg, provider, sysPrompt, sdkLog, realtimeCallback))
+	rt, err := api.New(context.Background(), runtimeopts.BuildAPIOptions(cfg, provider, sysPrompt, sdkLog, realtimeCallback, permissionHandler))
 	if err != nil {
 		return nil, fmt.Errorf("create runtime: %w", err)
 	}
@@ -117,6 +121,18 @@ type Gateway struct {
 	channelStatesFn func() map[string]channel.ChannelState
 	sendNowFn      func(bus.OutboundMessage) error
 	restartFn      func() error
+
+	approvalMu      sync.Mutex
+	pendingApproval map[string]pendingApproval
+}
+
+type pendingApproval struct {
+	requestID string
+	channel   string
+	chatID    string
+	toolName  string
+	target    string
+	decisionC chan events.PermissionDecisionType
 }
 
 // New creates a Gateway with default options
@@ -137,6 +153,7 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Gateway, error) {
 		cfg:           cfg,
 		logger:        sdklogger.NewZapLogger(zapLogger),
 		usageNotified: make(map[string]uint8),
+		pendingApproval: make(map[string]pendingApproval),
 	}
 
 	// Message bus
@@ -148,7 +165,21 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Gateway, error) {
 	// Build real-time event callback.
 	// Progress updates require toolLog.enabled; context window warnings always fire.
 	realtimeCallback := func(event api.RealtimeEvent) {
-		g.logger.Infof("[gateway] Realtime event: type=%s, count=%d, tool=%s", event.Type, event.Count, event.LastTool)
+		switch event.Type {
+		case api.RealtimeEventModelSwitch:
+			fromModel, _ := event.Metadata["from_model"].(string)
+			toModel, _ := event.Metadata["to_model"].(string)
+			lastError, _ := event.Metadata["last_error"].(string)
+			if strings.TrimSpace(lastError) != "" {
+				g.logger.Infof("[gateway] Realtime event: type=%s, from_model=%s, to_model=%s, error=%s",
+					event.Type, fromModel, toModel, lastError)
+			} else {
+				g.logger.Infof("[gateway] Realtime event: type=%s, from_model=%s, to_model=%s",
+					event.Type, fromModel, toModel)
+			}
+		default:
+			g.logger.Infof("[gateway] Realtime event: type=%s, count=%d, tool=%s", event.Type, event.Count, event.LastTool)
+		}
 		if g.currentChannelID == "" || g.currentChatID == "" {
 			return
 		}
@@ -217,14 +248,20 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Gateway, error) {
 	// Create runtime using factory (allows injection for testing)
 	factory := opts.RuntimeFactory
 	if factory == nil {
-		factory = DefaultRuntimeFactory
+		rt, rtErr := defaultRuntimeFactoryWithPermissions(cfg, sysPrompt, realtimeCallback, g.handlePermissionRequest)
+		if rtErr != nil {
+			return nil, rtErr
+		}
+		g.runtimeFactory = DefaultRuntimeFactory
+		g.runtime = rt
+	} else {
+		g.runtimeFactory = factory // Save factory for restart
+		rt, err := factory(cfg, sysPrompt, realtimeCallback)
+		if err != nil {
+			return nil, err
+		}
+		g.runtime = rt
 	}
-	g.runtimeFactory = factory // Save factory for restart
-	rt, err := factory(cfg, sysPrompt, realtimeCallback)
-	if err != nil {
-		return nil, err
-	}
-	g.runtime = rt
 
 	// Signal channel for testing
 	g.signalChan = opts.SignalChan
@@ -405,6 +442,9 @@ func (g *Gateway) processLoop(ctx context.Context) {
 		select {
 		case msg := <-g.bus.Inbound:
 			g.logger.Infof("[gateway] inbound from %s/%s: %s", msg.Channel, msg.SenderID, truncate(msg.Content, 80))
+			if g.tryHandleApprovalResponse(msg) {
+				continue
+			}
 
 			// Check if this is a special command
 			var cmdResult channel.CommandResult
@@ -483,6 +523,117 @@ func (g *Gateway) processLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (g *Gateway) handlePermissionRequest(ctx context.Context, req api.PermissionRequest) (events.PermissionDecisionType, error) {
+	sessionID := strings.TrimSpace(req.SessionID)
+	channelID, chatID := parseSessionID(sessionID)
+	if channelID == "" || chatID == "" {
+		return events.PermissionAsk, nil
+	}
+	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
+	pending := pendingApproval{
+		requestID: requestID,
+		channel:   channelID,
+		chatID:    chatID,
+		toolName:  strings.TrimSpace(req.ToolName),
+		target:    strings.TrimSpace(req.Target),
+		decisionC: make(chan events.PermissionDecisionType, 1),
+	}
+	g.approvalMu.Lock()
+	g.pendingApproval[sessionID] = pending
+	g.approvalMu.Unlock()
+
+	g.bus.Outbound <- bus.OutboundMessage{
+		Channel: channelID,
+		ChatID:  chatID,
+		Content: buildApprovalPrompt(pending.toolName, pending.target),
+		Metadata: map[string]any{
+			"approval_prompt": true,
+			"approval_id":     requestID,
+		},
+	}
+
+	select {
+	case decision := <-pending.decisionC:
+		g.approvalMu.Lock()
+		delete(g.pendingApproval, sessionID)
+		g.approvalMu.Unlock()
+		return decision, nil
+	case <-ctx.Done():
+		g.approvalMu.Lock()
+		delete(g.pendingApproval, sessionID)
+		g.approvalMu.Unlock()
+		return events.PermissionAsk, ctx.Err()
+	}
+}
+
+func (g *Gateway) tryHandleApprovalResponse(msg bus.InboundMessage) bool {
+	sessionID := msg.SessionKey()
+	g.approvalMu.Lock()
+	pending, ok := g.pendingApproval[sessionID]
+	g.approvalMu.Unlock()
+	if !ok {
+		return false
+	}
+
+	decision, approvalID, handled := parseApprovalDecision(msg)
+	if !handled {
+		return false
+	}
+	if approvalID != "" && approvalID != pending.requestID {
+		return false
+	}
+	select {
+	case pending.decisionC <- decision:
+	default:
+	}
+	ack := "已拒绝本次命令执行。"
+	if decision == events.PermissionAllow {
+		ack = "已批准，正在执行命令。"
+	}
+	g.bus.Outbound <- bus.OutboundMessage{
+		Channel: msg.Channel,
+		ChatID:  msg.ChatID,
+		ReplyTo: inboundReplyTo(msg),
+		Content: ack,
+	}
+	return true
+}
+
+func parseSessionID(sessionID string) (channelID string, chatID string) {
+	parts := strings.SplitN(strings.TrimSpace(sessionID), ":", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+}
+
+func buildApprovalPrompt(toolName, target string) string {
+	toolName = strings.TrimSpace(toolName)
+	target = strings.TrimSpace(target)
+	if toolName == "" {
+		toolName = "工具"
+	}
+	if target == "" {
+		return fmt.Sprintf("命令需要审批：`%s`", toolName)
+	}
+	return fmt.Sprintf("命令需要审批：`%s %s`", toolName, target)
+}
+
+func parseApprovalDecision(msg bus.InboundMessage) (events.PermissionDecisionType, string, bool) {
+	if msg.Metadata != nil {
+		approvalID, _ := msg.Metadata["approval_id"].(string)
+		if action, ok := msg.Metadata["approval_action"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(action)) {
+			case "allow", "approve", "yes":
+				return events.PermissionAllow, strings.TrimSpace(approvalID), true
+			case "deny", "reject", "no":
+				return events.PermissionDeny, strings.TrimSpace(approvalID), true
+			}
+		}
+	}
+	return events.PermissionAsk, "", false
 }
 
 func (g *Gateway) processAgent(ctx context.Context, msg bus.InboundMessage) {

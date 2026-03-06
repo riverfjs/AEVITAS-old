@@ -60,7 +60,7 @@ func DefaultRuntimeFactory(cfg *config.Config) (Runtime, error) {
 	provider := runtimeopts.NewProvider(cfg)
 	sdkLog := sdklogger.NewZapLogger(log)
 
-	rt, err := api.New(context.Background(), runtimeopts.BuildAPIOptions(cfg, provider, sysPrompt, sdkLog, nil))
+	rt, err := api.New(context.Background(), runtimeopts.BuildAPIOptions(cfg, provider, sysPrompt, sdkLog, nil, nil))
 	if err != nil {
 		return nil, fmt.Errorf("create runtime: %w", err)
 	}
