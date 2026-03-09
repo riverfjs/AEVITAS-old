@@ -1,4 +1,4 @@
-.PHONY: build run gateway test setup clean docker-up docker-down lint prod start stop restart install-ffmpeg
+.PHONY: build run gateway test setup clean docker-up docker-down lint prod start stop restart install-ffmpeg plugin-list plugin-install-feishu plugin-remove plugin-doctor plugin-run plugin-stop plugin-ps plugin-start-enabled plugin-stop-all
 
 BINARY    := aevitas
 BUILD_DIR := .
@@ -26,6 +26,58 @@ onboard: build
 ## Show status
 status: build
 	./$(BINARY) status
+
+## List installed runtime plugins
+plugin-list: build
+	./$(BINARY) plugin list
+
+## Install feishu official plugin package to ~/.aevitas/plugins
+plugin-install-feishu: build
+	./$(BINARY) plugin install feishuOfficial
+
+## Remove runtime plugin (usage: make plugin-remove PLUGIN=feishuOfficial)
+plugin-remove: build
+	@if [ -z "$(PLUGIN)" ]; then \
+		echo "Usage: make plugin-remove PLUGIN=<plugin-id>"; \
+		exit 1; \
+	fi
+	./$(BINARY) plugin remove "$(PLUGIN)"
+
+## Diagnose plugin install (usage: make plugin-doctor [PLUGIN=feishuOfficial])
+plugin-doctor: build
+	@if [ -z "$(PLUGIN)" ]; then \
+		./$(BINARY) plugin doctor; \
+	else \
+		./$(BINARY) plugin doctor "$(PLUGIN)"; \
+	fi
+
+## Run plugin runtime dynamically from plugin runtime.json (usage: make plugin-run PLUGIN=feishuOfficial)
+plugin-run: build
+	@if [ -z "$(PLUGIN)" ]; then \
+		echo "Usage: make plugin-run PLUGIN=<plugin-id>"; \
+		exit 1; \
+	fi
+	./$(BINARY) plugin run "$(PLUGIN)"
+
+## Stop plugin runtime (usage: make plugin-stop PLUGIN=feishuOfficial)
+plugin-stop: build
+	@if [ -z "$(PLUGIN)" ]; then \
+		echo "Usage: make plugin-stop PLUGIN=<plugin-id>"; \
+		exit 1; \
+	fi
+	./$(BINARY) plugin stop "$(PLUGIN)"
+
+## Show plugin runtime status
+plugin-ps: build
+	./$(BINARY) plugin ps
+
+## Start all enabled plugins from registry
+plugin-start-enabled: build
+	./$(BINARY) plugin start-enabled
+
+## Stop all running plugin runtimes
+plugin-stop-all: build
+	./$(BINARY) plugin stop-all
 
 ## List installed skills
 skills-list: build
@@ -89,6 +141,13 @@ prod: install-ffmpeg
 	@echo "Installing aevitas to $(INSTALL_DIR)..."
 	@mkdir -p $(INSTALL_DIR)
 	@cp $(BINARY) $(INSTALL_DIR)/$(BINARY)
+	@mkdir -p "$(HOME)/.aevitas/scripts"
+	@cp scripts/start.sh "$(HOME)/.aevitas/scripts/start.sh"
+	@cp scripts/stop.sh "$(HOME)/.aevitas/scripts/stop.sh"
+	@cp scripts/restart.sh "$(HOME)/.aevitas/scripts/restart.sh"
+	@chmod +x "$(HOME)/.aevitas/scripts/start.sh" "$(HOME)/.aevitas/scripts/stop.sh" "$(HOME)/.aevitas/scripts/restart.sh"
+	@rm -rf "$(INSTALL_DIR)/shim"
+	@cp -R shim "$(INSTALL_DIR)/shim"
 	@echo "✓ aevitas installed to $(INSTALL_DIR)/$(BINARY)"
 	@echo "Use 'make start' or 'scripts/start.sh' to start in background"
 
@@ -152,6 +211,15 @@ help:
 	@echo "  gateway          Start gateway (channels + cron + heartbeat)"
 	@echo "  onboard          Initialize config and workspace"
 	@echo "  status           Show aevitas status"
+	@echo "  plugin-list      List installed runtime plugins"
+	@echo "  plugin-install-feishu Install official Feishu plugin package"
+	@echo "  plugin-remove PLUGIN=<id> Remove plugin"
+	@echo "  plugin-doctor [PLUGIN=<id>] Check plugin installation"
+	@echo "  plugin-run PLUGIN=<id> Start plugin runtime from descriptor"
+	@echo "  plugin-stop PLUGIN=<id> Stop plugin runtime"
+	@echo "  plugin-ps       Show plugin runtime status"
+	@echo "  plugin-start-enabled Start enabled plugin runtimes"
+	@echo "  plugin-stop-all Stop all plugin runtimes"
 	@echo "  setup            Interactive config setup"
 	@echo "  prod             Build + install + download ffmpeg/ffprobe"
 	@echo ""

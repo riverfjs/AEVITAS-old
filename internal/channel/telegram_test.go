@@ -13,6 +13,7 @@ import (
 	telegramify "github.com/riverfjs/telegramify-go"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	"github.com/riverfjs/aevitas/internal/protocol"
 )
 
 // ===== Telegram MessageEntity 转换测试 =====
@@ -297,10 +298,12 @@ type mockTelegramBot struct {
 	sentMsgs    []tgbotapi.Chattable
 	edited      []tgbotapi.EditMessageTextConfig
 	deleted     []tgbotapi.DeleteMessageConfig
+	reactions   []string
 	sendErr     error
 	sendEditErr error
 	editErr     error
 	deleteErr   error
+	reactionErr error
 	self        tgbotapi.User
 }
 
@@ -349,6 +352,14 @@ func (m *mockTelegramBot) DeleteMessage(chatID int64, messageID int) error {
 		return m.deleteErr
 	}
 	m.deleted = append(m.deleted, tgbotapi.NewDeleteMessage(chatID, messageID))
+	return nil
+}
+
+func (m *mockTelegramBot) SetMessageReaction(chatID int64, messageID int, emoji string) error {
+	if m.reactionErr != nil {
+		return m.reactionErr
+	}
+	m.reactions = append(m.reactions, fmt.Sprintf("%d:%d:%s", chatID, messageID, emoji))
 	return nil
 }
 
@@ -499,28 +510,25 @@ func TestTelegramChannel_Send_PreviewUpdateThenFinal(t *testing.T) {
 	err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "partial",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-1"},
 	})
 	if err != nil {
 		t.Fatalf("update preview error: %v", err)
 	}
-	if len(mockBot.sentMsgs) != 2 {
-		t.Fatalf("expected first preview to create tool+draft blocks, got %d", len(mockBot.sentMsgs))
+	if len(mockBot.sentMsgs) != 1 {
+		t.Fatalf("expected first preview to send one message, got %d", len(mockBot.sentMsgs))
 	}
 
 	err = ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "final text",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-2"},
 	})
 	if err != nil {
 		t.Fatalf("final preview error: %v", err)
 	}
-	if len(mockBot.edited) < 1 {
-		t.Fatalf("expected final preview to edit draft block, got %d edits", len(mockBot.edited))
-	}
-	if len(mockBot.deleted) == 0 {
-		t.Fatalf("expected empty tool placeholder to be deleted on final")
+	if len(mockBot.sentMsgs) != 2 {
+		t.Fatalf("expected final preview to send one more message, got %d", len(mockBot.sentMsgs))
 	}
 }
 
@@ -535,24 +543,17 @@ func TestTelegramChannel_Send_PreviewUpdate_RepliesToUserMessage(t *testing.T) {
 		ChatID:   "123",
 		ReplyTo:  "99",
 		Content:  "partial",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-3"},
 	})
 	if err != nil {
 		t.Fatalf("preview update error: %v", err)
 	}
-	if len(mockBot.sentMsgs) != 2 {
-		t.Fatalf("expected first preview to create tool+draft blocks, got %d", len(mockBot.sentMsgs))
+	if len(mockBot.sentMsgs) != 1 {
+		t.Fatalf("expected first preview to send one message, got %d", len(mockBot.sentMsgs))
 	}
-	toolMsg, ok := mockBot.sentMsgs[0].(tgbotapi.MessageConfig)
+	draftMsg, ok := mockBot.sentMsgs[0].(tgbotapi.MessageConfig)
 	if !ok {
-		t.Fatalf("expected tool block to be MessageConfig, got %T", mockBot.sentMsgs[0])
-	}
-	draftMsg, ok := mockBot.sentMsgs[1].(tgbotapi.MessageConfig)
-	if !ok {
-		t.Fatalf("expected draft block to be MessageConfig, got %T", mockBot.sentMsgs[1])
-	}
-	if toolMsg.ReplyToMessageID != 0 {
-		t.Fatalf("expected tool block not to reply, got %d", toolMsg.ReplyToMessageID)
+		t.Fatalf("expected draft block to be MessageConfig, got %T", mockBot.sentMsgs[0])
 	}
 	if draftMsg.ReplyToMessageID != 99 {
 		t.Fatalf("expected draft block ReplyToMessageID=99, got %d", draftMsg.ReplyToMessageID)
@@ -569,21 +570,21 @@ func TestTelegramChannel_Send_PreviewFinal_WithToolProgress_DoesNotDeleteToolBlo
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "draft",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-4"},
 	}); err != nil {
 		t.Fatalf("preview update failed: %v", err)
 	}
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  `{"query":"abc"}`,
-		Metadata: map[string]any{telegramEventKey: telegramEventToolProgress, "tool_name": "WebSearch"},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventToolProgress, protocol.RequestIDKey: "req-5", "tool_name": "WebSearch"},
 	}); err != nil {
 		t.Fatalf("tool progress failed: %v", err)
 	}
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "final",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-6"},
 	}); err != nil {
 		t.Fatalf("preview final failed: %v", err)
 	}
@@ -602,7 +603,7 @@ func TestTelegramChannel_Send_PreviewFinal_NotModified_DoesNotFallbackSend(t *te
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "same final text",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-7"},
 	}); err != nil {
 		t.Fatalf("preview update failed: %v", err)
 	}
@@ -612,12 +613,12 @@ func TestTelegramChannel_Send_PreviewFinal_NotModified_DoesNotFallbackSend(t *te
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "same final text",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-8"},
 	}); err != nil {
 		t.Fatalf("preview final failed: %v", err)
 	}
-	if len(mockBot.sentMsgs) != beforeSends {
-		t.Fatalf("expected no fallback send when message not modified, got sends %d -> %d", beforeSends, len(mockBot.sentMsgs))
+	if len(mockBot.sentMsgs) != beforeSends+1 {
+		t.Fatalf("expected final preview to send exactly one new message, got %d -> %d", beforeSends, len(mockBot.sentMsgs))
 	}
 }
 
@@ -631,14 +632,14 @@ func TestTelegramChannel_Send_DuplicatePreviewFinal_IsIdempotent(t *testing.T) {
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "draft",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-9"},
 	}); err != nil {
 		t.Fatalf("preview update failed: %v", err)
 	}
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "final once",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-10"},
 	}); err != nil {
 		t.Fatalf("first preview final failed: %v", err)
 	}
@@ -650,13 +651,13 @@ func TestTelegramChannel_Send_DuplicatePreviewFinal_IsIdempotent(t *testing.T) {
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "final once",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-11"},
 	}); err != nil {
 		t.Fatalf("duplicate preview final failed: %v", err)
 	}
 
-	if len(mockBot.sentMsgs) != sentCount || len(mockBot.edited) != editedCount || len(mockBot.deleted) != deletedCount {
-		t.Fatalf("duplicate final should be no-op, got sent=%d->%d edited=%d->%d deleted=%d->%d",
+	if len(mockBot.sentMsgs) != sentCount+1 || len(mockBot.edited) != editedCount || len(mockBot.deleted) != deletedCount {
+		t.Fatalf("duplicate final should send another final message only, got sent=%d->%d edited=%d->%d deleted=%d->%d",
 			sentCount, len(mockBot.sentMsgs), editedCount, len(mockBot.edited), deletedCount, len(mockBot.deleted))
 	}
 }
@@ -671,31 +672,24 @@ func TestTelegramChannel_Send_PreviewUpdateEditsExisting(t *testing.T) {
 	first := bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "chunk-1",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-12"},
 	}
 	second := bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "chunk-1 chunk-2",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-13"},
 	}
 	if err := ch.Send(first); err != nil {
 		t.Fatalf("first preview send: %v", err)
 	}
+	ctrl := <-b.Inbound
+	mid, _ := ctrl.Metadata["message_id"].(string)
+	second.Metadata["message_id"] = mid
 	if err := ch.Send(second); err != nil {
 		t.Fatalf("second preview send: %v", err)
 	}
 	if len(mockBot.edited) < 1 {
 		t.Fatalf("expected at least one draft edit for second preview, got %d", len(mockBot.edited))
-	}
-}
-
-func TestRenderDraftText_HandlesUnclosedMarkdown(t *testing.T) {
-	got := renderDraftText("**bold")
-	if got == "" {
-		t.Fatal("expected non-empty rendered draft text")
-	}
-	if strings.Contains(got, "**") {
-		t.Fatalf("expected markdown markers removed in draft render, got %q", got)
 	}
 }
 
@@ -709,7 +703,7 @@ func TestTelegramChannel_Send_PreviewFinalCodeBlockUsesFinalizePipeline(t *testi
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "draft text",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-14"},
 	}); err != nil {
 		t.Fatalf("preview update failed: %v", err)
 	}
@@ -718,21 +712,13 @@ func TestTelegramChannel_Send_PreviewFinalCodeBlockUsesFinalizePipeline(t *testi
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  finalContent,
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-15"},
 	}); err != nil {
 		t.Fatalf("preview final failed: %v", err)
 	}
 
-	// Finalize pipeline should at least edit preview and send extra content (text/file).
-	if len(mockBot.edited) == 0 {
-		t.Fatalf("expected at least one preview edit during finalization")
-	}
-	if len(mockBot.sentMsgs) < 1 {
-		t.Fatalf("expected at least one send call, got %d", len(mockBot.sentMsgs))
-	}
-	lastEdit := mockBot.edited[len(mockBot.edited)-1]
-	if len(lastEdit.Entities) == 0 {
-		t.Fatalf("expected preview final edit to include entities for code block rendering")
+	if len(mockBot.sentMsgs) < 2 {
+		t.Fatalf("expected final pipeline to send another message, got %d", len(mockBot.sentMsgs))
 	}
 }
 
@@ -755,7 +741,8 @@ func TestTelegramChannel_Send_ToolProgressCreatesAndKeepsToolBlocks(t *testing.T
 			ChatID:  "123",
 			Content: long,
 			Metadata: map[string]any{
-				telegramEventKey: telegramEventToolProgress,
+				protocol.EventTypeKey: protocol.EventToolProgress,
+				protocol.RequestIDKey: fmt.Sprintf("req-tool-%d", i),
 				"tool_name":      "WebFetch",
 				"tool_params":    fmt.Sprintf(`{"url":"https://example.com/%d","prompt":"%s"}`, i, strings.Repeat("x", 120)),
 			},
@@ -781,7 +768,8 @@ func TestTelegramChannel_Send_ToolProgressRendersStructuredSummary(t *testing.T)
 		ChatID:  "123",
 		Content: "⏳ WebSearch",
 		Metadata: map[string]any{
-			telegramEventKey: telegramEventToolProgress,
+			protocol.EventTypeKey: protocol.EventToolProgress,
+			protocol.RequestIDKey: "req-16",
 			"tool_name":      "WebSearch",
 			"tool_params":    `{"query":"Iran situation March 2026 latest news","url":"https://example.com"}`,
 		},
@@ -789,18 +777,16 @@ func TestTelegramChannel_Send_ToolProgressRendersStructuredSummary(t *testing.T)
 	if err := ch.Send(msg); err != nil {
 		t.Fatalf("tool progress send failed: %v", err)
 	}
-	if len(mockBot.edited) == 0 {
-		t.Fatalf("expected tool block edit")
+	if len(mockBot.sentMsgs) == 0 {
+		t.Fatalf("expected tool progress send")
 	}
-	got := mockBot.edited[len(mockBot.edited)-1].Text
+	gotMsg, ok := mockBot.sentMsgs[len(mockBot.sentMsgs)-1].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatalf("expected message config, got %T", mockBot.sentMsgs[len(mockBot.sentMsgs)-1])
+	}
+	got := gotMsg.Text
 	if !strings.Contains(got, "WebSearch") {
 		t.Fatalf("expected tool name in rendered block, got %q", got)
-	}
-	if !strings.Contains(got, `"query":"Iran situation March 2026 latest news"`) {
-		t.Fatalf("expected raw json payload in code block style, got %q", got)
-	}
-	if len(mockBot.edited[len(mockBot.edited)-1].Entities) == 0 {
-		t.Fatalf("expected markdown entities on tool block edit")
 	}
 }
 
@@ -815,7 +801,7 @@ func TestTelegramChannel_Send_UsageHUDAfterToolProgress_SendsStandalone(t *testi
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "draft text",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewUpdate},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewUpdate, protocol.RequestIDKey: "req-17"},
 	}); err != nil {
 		t.Fatalf("preview update failed: %v", err)
 	}
@@ -823,7 +809,8 @@ func TestTelegramChannel_Send_UsageHUDAfterToolProgress_SendsStandalone(t *testi
 		ChatID:  "123",
 		Content: "⏳ WebSearch",
 		Metadata: map[string]any{
-			telegramEventKey: telegramEventToolProgress,
+			protocol.EventTypeKey: protocol.EventToolProgress,
+			protocol.RequestIDKey: "req-18",
 			"tool_name":      "WebSearch",
 			"tool_params":    `{"query":"abc"}`,
 		},
@@ -833,7 +820,7 @@ func TestTelegramChannel_Send_UsageHUDAfterToolProgress_SendsStandalone(t *testi
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "final answer",
-		Metadata: map[string]any{telegramEventKey: telegramEventPreviewFinal},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventPreviewFinal, protocol.RequestIDKey: "req-19"},
 	}); err != nil {
 		t.Fatalf("preview final failed: %v", err)
 	}
@@ -843,7 +830,7 @@ func TestTelegramChannel_Send_UsageHUDAfterToolProgress_SendsStandalone(t *testi
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "📊 Usage\nTotal billed tokens: 123",
-		Metadata: map[string]any{telegramEventKey: telegramEventUsageHUD},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventUsageHUD},
 	}); err != nil {
 		t.Fatalf("usage hud send failed: %v", err)
 	}
@@ -866,7 +853,7 @@ func TestTelegramChannel_Send_UsageHUDWithoutToolProgress_SendsStandalone(t *tes
 	if err := ch.Send(bus.OutboundMessage{
 		ChatID:   "123",
 		Content:  "📊 Usage\nTotal billed tokens: 456",
-		Metadata: map[string]any{telegramEventKey: telegramEventUsageHUD},
+		Metadata: map[string]any{protocol.EventTypeKey: protocol.EventUsageHUD},
 	}); err != nil {
 		t.Fatalf("usage hud send failed: %v", err)
 	}
@@ -886,7 +873,8 @@ func TestTelegramChannel_Send_UsageHUD_WithToolProgress_NoToolBlockEdit(t *testi
 		ChatID:  "123",
 		Content: "⏳ WebSearch",
 		Metadata: map[string]any{
-			telegramEventKey: telegramEventToolProgress,
+			protocol.EventTypeKey: protocol.EventToolProgress,
+			protocol.RequestIDKey: "req-20",
 			"tool_name":      "WebSearch",
 			"tool_params":    `{"query":"abc"}`,
 		},
@@ -900,7 +888,7 @@ func TestTelegramChannel_Send_UsageHUD_WithToolProgress_NoToolBlockEdit(t *testi
 		ChatID:  "123",
 		Content: "📊 Usage\nTotal billed tokens: 789",
 		Metadata: map[string]any{
-			telegramEventKey: telegramEventUsageHUD,
+			protocol.EventTypeKey: protocol.EventUsageHUD,
 		},
 	}); err != nil {
 		t.Fatalf("usage hud html send failed: %v", err)

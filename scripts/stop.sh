@@ -1,41 +1,39 @@
 #!/bin/bash
-# Stop aevitas gateway gracefully
+# Stop aevitas gateway with pid fallback detection
+
+set -e
 
 PID_FILE="${HOME}/.aevitas/aevitas.pid"
+ts() { date "+%Y-%m-%dT%H:%M:%S%z"; }
+echo "[$(ts)] [stop.sh] begin"
 
-if [ ! -f "$PID_FILE" ]; then
-    echo "aevitas gateway is not running (no PID file)"
-    exit 0
+TARGET_PID=""
+if [ -f "$PID_FILE" ]; then
+    TARGET_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 fi
-
-PID=$(cat "$PID_FILE")
-
-if ! ps -p "$PID" > /dev/null 2>&1; then
-    echo "aevitas gateway is not running (stale PID file)"
+case "$TARGET_PID" in
+    ''|*[!0-9]*) TARGET_PID="" ;;
+esac
+if [ -n "$TARGET_PID" ] && ! kill -0 "$TARGET_PID" 2>/dev/null; then
+    TARGET_PID=""
+fi
+if [ -z "$TARGET_PID" ]; then
+    TARGET_PID="$(pgrep -f "\\.aevitas/bin/aevitas gateway" | head -n 1 || true)"
+fi
+if [ -z "$TARGET_PID" ]; then
     rm -f "$PID_FILE"
+    echo "aevitas gateway is not running"
+    echo "[$(ts)] [stop.sh] no gateway process found, done"
     exit 0
 fi
-
-echo "Stopping aevitas gateway (PID: $PID)..."
-kill -TERM "$PID"
-
-# Wait for process to exit (max 10 seconds)
-for i in {1..10}; do
-    if ! ps -p "$PID" > /dev/null 2>&1; then
-        echo "aevitas gateway stopped successfully"
-        rm -f "$PID_FILE"
-        exit 0
-    fi
-    sleep 1
-done
-
-# Force kill if still running
-if ps -p "$PID" > /dev/null 2>&1; then
-    echo "Force killing aevitas gateway..."
-    kill -9 "$PID"
-    sleep 1
+echo "Stopping aevitas gateway (PID: $TARGET_PID)..."
+kill -TERM "$TARGET_PID" >/dev/null 2>&1 || true
+sleep 1
+if kill -0 "$TARGET_PID" 2>/dev/null; then
+    kill -KILL "$TARGET_PID" >/dev/null 2>&1 || true
 fi
-
 rm -f "$PID_FILE"
-echo "aevitas gateway stopped"
+echo "Stop signal sent"
+echo "[$(ts)] [stop.sh] stopped gateway pid=$TARGET_PID removed pid file"
+echo "[$(ts)] [stop.sh] done"
 

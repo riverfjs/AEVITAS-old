@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/riverfjs/aevitas/internal/config"
 	"github.com/riverfjs/aevitas/internal/gateway"
 	"github.com/riverfjs/aevitas/internal/logger"
+	"github.com/riverfjs/aevitas/internal/pluginmgr"
 	"github.com/riverfjs/aevitas/internal/runtimeopts"
 	"github.com/riverfjs/aevitas/pkg/utils"
 	"github.com/riverfjs/agentsdk-go/pkg/api"
@@ -60,7 +62,7 @@ func DefaultRuntimeFactory(cfg *config.Config) (Runtime, error) {
 	provider := runtimeopts.NewProvider(cfg)
 	sdkLog := sdklogger.NewZapLogger(log)
 
-	rt, err := api.New(context.Background(), runtimeopts.BuildAPIOptions(cfg, provider, sysPrompt, sdkLog, nil, nil))
+	rt, err := api.New(context.Background(), runtimeopts.BuildAPIOptions(cfg, provider, sysPrompt, sdkLog, nil, nil, nil))
 	if err != nil {
 		return nil, fmt.Errorf("create runtime: %w", err)
 	}
@@ -142,15 +144,95 @@ var skillsVerifyCmd = &cobra.Command{
 	RunE:  runSkillsVerify,
 }
 
+var pluginCmd = &cobra.Command{
+	Use:   "plugin",
+	Short: "Manage runtime plugins",
+}
+
+var pluginListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List installed plugins",
+	RunE:  runPluginList,
+}
+
+var pluginInstallCmd = &cobra.Command{
+	Use:   "install <plugin-id>",
+	Short: "Install plugin into ~/.aevitas/plugins",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runPluginInstall,
+}
+
+var pluginRemoveCmd = &cobra.Command{
+	Use:   "remove <plugin-id>",
+	Short: "Remove installed plugin",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runPluginRemove,
+}
+
+var pluginDoctorCmd = &cobra.Command{
+	Use:   "doctor [plugin-id]",
+	Short: "Check plugin installation status",
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runPluginDoctor,
+}
+
+var pluginRunCmd = &cobra.Command{
+	Use:   "run <plugin-id>",
+	Short: "Start plugin runtime process dynamically",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runPluginRun,
+}
+
+var pluginStopCmd = &cobra.Command{
+	Use:   "stop <plugin-id>",
+	Short: "Stop plugin runtime process",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runPluginStop,
+}
+
+var pluginPsCmd = &cobra.Command{
+	Use:   "ps",
+	Short: "List plugin runtime process status",
+	RunE:  runPluginPS,
+}
+
+var pluginHealthCmd = &cobra.Command{
+	Use:   "health [plugin-id]",
+	Short: "Probe runtime process health",
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runPluginHealth,
+}
+
+var pluginStartEnabledCmd = &cobra.Command{
+	Use:   "start-enabled",
+	Short: "Start all enabled plugins from config",
+	RunE:  runPluginStartEnabled,
+}
+
+var pluginStopAllCmd = &cobra.Command{
+	Use:   "stop-all",
+	Short: "Stop all running plugin runtimes",
+	RunE:  runPluginStopAll,
+}
+
+var pluginReconcileCmd = &cobra.Command{
+	Use:    "reconcile <start-enabled|stop-all>",
+	Short:  "Internal reconciler for plugin runtime",
+	Args:   cobra.ExactArgs(1),
+	Hidden: true,
+	RunE:   runPluginReconcile,
+}
+
 func init() {
 	skillsCmd.AddCommand(skillsListCmd, skillsInstallCmd, skillsUpdateCmd, skillsUninstallCmd, skillsVerifyCmd)
+	pluginCmd.AddCommand(pluginListCmd, pluginInstallCmd, pluginRemoveCmd, pluginDoctorCmd, pluginRunCmd, pluginStopCmd, pluginPsCmd, pluginHealthCmd, pluginStartEnabledCmd, pluginStopAllCmd, pluginReconcileCmd)
 }
 
 var messageFlag string
 
 func init() {
 	agentCmd.Flags().StringVarP(&messageFlag, "message", "m", "", "Single message to send")
-	rootCmd.AddCommand(agentCmd, gatewayCmd, onboardCmd, statusCmd, skillsCmd)
+	rootCmd.AddCommand(agentCmd, gatewayCmd, onboardCmd, statusCmd, skillsCmd, pluginCmd)
 }
 
 func main() {
@@ -335,9 +417,27 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Println("API Key: not set")
 	}
-	fmt.Printf("Telegram: enabled=%v\n", cfg.Channels.Telegram.Enabled)
-	fmt.Printf("Feishu: enabled=%v\n", cfg.Channels.Feishu.Enabled)
-	fmt.Printf("WeCom: enabled=%v\n", cfg.Channels.WeCom.Enabled)
+	channelStatus := cfg.EnabledChannels()
+	for _, name := range config.SortedStatusKeys(channelStatus) {
+		fmt.Printf("Channel[%s]: enabled=%v\n", name, channelStatus[name])
+	}
+	store := pluginmgr.NewStore(cfg)
+	reg, regErr := store.List()
+	if regErr != nil {
+		fmt.Printf("PluginRegistry: error (%v)\n", regErr)
+	} else {
+		printPluginRegistry(cfg.PluginHomeDir(), reg)
+	}
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	if runtimes, rtErr := runtimeMgr.ListStatus(); rtErr != nil {
+		fmt.Printf("PluginRuntime: error (%v)\n", rtErr)
+	} else if len(runtimes) == 0 {
+		fmt.Println("PluginRuntime: empty")
+	} else {
+		for _, rt := range runtimes {
+			fmt.Printf("PluginRuntime[%s]: running=%v pid=%d command=%s log=%s\n", rt.PluginID, rt.Running, rt.PID, rt.Command, rt.LogPath)
+		}
+	}
 
 	if _, err := os.Stat(cfg.Agent.Workspace); err != nil {
 		fmt.Println("Workspace: not found (run 'aevitas onboard')")
@@ -545,4 +645,205 @@ func runSkillsVerify(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("\nAll skills verified successfully.")
 	return nil
+}
+
+func runPluginList(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	store := pluginmgr.NewStore(cfg)
+	reg, err := store.List()
+	if err != nil {
+		return err
+	}
+	printPluginRegistry(cfg.PluginHomeDir(), reg)
+	return nil
+}
+
+func runPluginInstall(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	store := pluginmgr.NewStore(cfg)
+	pluginID := strings.TrimSpace(args[0])
+	entry, err := store.InstallPlugin(pluginID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Installed %s version=%s path=%s\n", entry.ID, entry.Version, entry.InstallPath)
+	return nil
+}
+
+func runPluginRemove(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	store := pluginmgr.NewStore(cfg)
+	if err := store.Remove(strings.TrimSpace(args[0])); err != nil {
+		return err
+	}
+	fmt.Printf("Removed plugin %s\n", strings.TrimSpace(args[0]))
+	return nil
+}
+
+func runPluginDoctor(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	store := pluginmgr.NewStore(cfg)
+	id := ""
+	if len(args) > 0 {
+		id = strings.TrimSpace(args[0])
+	}
+	report, err := store.Doctor(id)
+	if err != nil {
+		return err
+	}
+	fmt.Println(report)
+	return nil
+}
+
+func runPluginRun(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	pluginID := strings.TrimSpace(args[0])
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	spec, err := runtimeMgr.ResolveRuntimeSpec(pluginID)
+	if err != nil {
+		return err
+	}
+	st, err := runtimeMgr.Start(pluginID, spec)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("PluginRuntime[%s]: started pid=%d log=%s\n", st.PluginID, st.PID, st.LogPath)
+	return nil
+}
+
+func runPluginStartEnabled(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	if err := runtimeMgr.ReconcileStartEnabled(); err != nil {
+		return err
+	}
+	fmt.Println("PluginRuntime: start-enabled done")
+	return nil
+}
+
+func runPluginStopAll(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	if err := runtimeMgr.ReconcileStopAll(); err != nil {
+		return err
+	}
+	fmt.Println("PluginRuntime: stop-all done")
+	return nil
+}
+
+func runPluginReconcile(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	switch strings.TrimSpace(args[0]) {
+	case "start-enabled":
+		return runtimeMgr.ReconcileStartEnabled()
+	case "stop-all":
+		return runtimeMgr.ReconcileStopAll()
+	default:
+		return fmt.Errorf("unsupported reconcile mode: %s", args[0])
+	}
+}
+
+func runPluginStop(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	pluginID := strings.TrimSpace(args[0])
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	st, err := runtimeMgr.Stop(pluginID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("PluginRuntime[%s]: running=%v pid=%d\n", st.PluginID, st.Running, st.PID)
+	return nil
+}
+
+func runPluginPS(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	items, err := runtimeMgr.ListStatus()
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Println("PluginRuntime: empty")
+		return nil
+	}
+	for _, st := range items {
+		fmt.Printf("PluginRuntime[%s]: running=%v pid=%d command=%s log=%s\n", st.PluginID, st.Running, st.PID, st.Command, st.LogPath)
+	}
+	return nil
+}
+
+func runPluginHealth(cmd *cobra.Command, args []string) error {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+	runtimeMgr := pluginmgr.NewRuntimeManager(cfg)
+	if len(args) == 1 {
+		st, err := runtimeMgr.Status(strings.TrimSpace(args[0]))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("PluginRuntime[%s]: status=%s running=%v pid=%d lastError=%s\n", st.PluginID, st.Status, st.Running, st.PID, st.LastError)
+		return nil
+	}
+	items, err := runtimeMgr.ListStatus()
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Println("PluginRuntime: empty")
+		return nil
+	}
+	for _, item := range items {
+		fmt.Printf("PluginRuntime[%s]: status=%s running=%v pid=%d lastError=%s\n", item.PluginID, item.Status, item.Running, item.PID, item.LastError)
+	}
+	return nil
+}
+
+func printPluginRegistry(home string, reg pluginmgr.Registry) {
+	fmt.Printf("Plugin home: %s\n", home)
+	if len(reg.Plugins) == 0 {
+		fmt.Println("PluginRegistry: empty")
+		return
+	}
+	pluginIDs := make([]string, 0, len(reg.Plugins))
+	for id := range reg.Plugins {
+		pluginIDs = append(pluginIDs, id)
+	}
+	sort.Strings(pluginIDs)
+	for _, id := range pluginIDs {
+		p := reg.Plugins[id]
+		fmt.Printf("Plugin[%s]: installed=true enabled=%v version=%s path=%s source=%s\n", id, p.Enabled, p.Version, p.InstallPath, p.Source)
+	}
 }

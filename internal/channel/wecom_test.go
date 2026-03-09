@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 )
 
 type mockWeComSend struct {
@@ -349,8 +349,10 @@ func TestWeComChannel_Send_ResponseURLMissing(t *testing.T) {
 
 func TestChannelManager_WeComEnabled_MissingConfig(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	_, err := NewChannelManager(config.ChannelsConfig{
-		WeCom: config.WeComConfig{Enabled: true},
+	_, err := NewChannelManager(&config.Config{
+		Channels: config.ChannelsConfig{
+			WeCom: config.WeComConfig{Enabled: true},
+		},
 	}, b, sdklogger.NewDefault())
 	if err == nil {
 		t.Fatal("expected error for missing wecom required config")
@@ -359,12 +361,14 @@ func TestChannelManager_WeComEnabled_MissingConfig(t *testing.T) {
 
 func TestChannelManager_WeComEnabled(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	m, err := NewChannelManager(config.ChannelsConfig{
-		WeCom: config.WeComConfig{
-			Enabled:        true,
-			Token:          "verify-token",
-			EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
-			AllowFrom:      []string{"zhangsan"},
+	m, err := NewChannelManager(&config.Config{
+		Channels: config.ChannelsConfig{
+			WeCom: config.WeComConfig{
+				Enabled:        true,
+				Token:          "verify-token",
+				EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+				AllowFrom:      []string{"zhangsan"},
+			},
 		},
 	}, b, sdklogger.NewDefault())
 	if err != nil {

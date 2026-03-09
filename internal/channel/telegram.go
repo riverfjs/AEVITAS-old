@@ -1,7 +1,6 @@
 package channel
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,18 +11,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	telegramify "github.com/riverfjs/telegramify-go"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	"github.com/riverfjs/aevitas/internal/protocol"
 	"github.com/riverfjs/agentsdk-go/pkg/api"
+	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
+	telegramify "github.com/riverfjs/telegramify-go"
 )
 
 const telegramChannelName = "telegram"
+
+const telegramInboundReactionEmoji = "👾"
 
 // TelegramBot interface for mocking telegram bot API
 type TelegramBot interface {
@@ -32,6 +33,7 @@ type TelegramBot interface {
 	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
 	EditMessageText(chatID int64, messageID int, text string) (tgbotapi.Message, error)
 	DeleteMessage(chatID int64, messageID int) error
+	SetMessageReaction(chatID int64, messageID int, emoji string) error
 	GetSelf() tgbotapi.User
 	GetFileDirectURL(fileID string) (string, error)
 }
@@ -64,6 +66,30 @@ func (w *tgBotWrapper) DeleteMessage(chatID int64, messageID int) error {
 	return err
 }
 
+func (w *tgBotWrapper) SetMessageReaction(chatID int64, messageID int, emoji string) error {
+	reaction, err := json.Marshal([]map[string]string{
+		{
+			"type":  "emoji",
+			"emoji": strings.TrimSpace(emoji),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal telegram reaction: %w", err)
+	}
+	resp, err := w.bot.MakeRequest("setMessageReaction", tgbotapi.Params{
+		"chat_id":    strconv.FormatInt(chatID, 10),
+		"message_id": strconv.Itoa(messageID),
+		"reaction":   string(reaction),
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Ok {
+		return fmt.Errorf("telegram setMessageReaction failed: %s", resp.Description)
+	}
+	return nil
+}
+
 func (w *tgBotWrapper) GetSelf() tgbotapi.User {
 	return w.bot.Self
 }
@@ -91,37 +117,7 @@ type TelegramChannel struct {
 	proxy      string
 	cancel     context.CancelFunc
 	botFactory BotFactory
-	previewMu  sync.Mutex
-	previewMsg map[int64]previewState
 }
-
-type previewState struct {
-	draftMessageID int
-	toolMessageID  int
-	replyToMessageID int
-	lastDraftText  string
-	lastEditAt     time.Time
-	toolBlockIndex int
-	toolEntries    []toolEntry
-	hadToolProgress bool
-	finalized      bool
-}
-
-type toolEntry struct {
-	Name      string
-	ParamsRaw string
-	When      string
-	Raw       string
-}
-
-const (
-	telegramEventKey           = "telegram_event"
-	telegramEventPreviewUpdate = "preview_update"
-	telegramEventPreviewFinal  = "preview_final"
-	telegramEventToolProgress  = "tool_progress"
-	telegramEventUsageHUD      = "usage_hud"
-	maxToolBlockChars          = 3800
-)
 
 func NewTelegramChannel(cfg config.TelegramConfig, b *bus.MessageBus, logger sdklogger.Logger) (*TelegramChannel, error) {
 	return NewTelegramChannelWithFactory(cfg, b, defaultBotFactory, logger)
@@ -138,7 +134,6 @@ func NewTelegramChannelWithFactory(cfg config.TelegramConfig, b *bus.MessageBus,
 		token:       cfg.Token,
 		proxy:       cfg.Proxy,
 		botFactory:  factory,
-		previewMsg:  make(map[int64]previewState),
 	}
 	return ch, nil
 }
@@ -289,6 +284,7 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 	}
 
 	chatID := strconv.FormatInt(msg.Chat.ID, 10)
+	go t.sendInboundReaction(msg.Chat.ID, msg.MessageID)
 
 	// Start continuous typing indicator (stops when message is received in Inbound channel)
 	// Telegram typing indicator lasts 5 seconds, so we resend every 4 seconds
@@ -296,11 +292,11 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 	go func() {
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
-		
+
 		// Send first typing immediately
 		typing := tgbotapi.NewChatAction(msg.Chat.ID, tgbotapi.ChatTyping)
 		t.bot.Send(typing)
-		
+
 		for {
 			select {
 			case <-stopTyping:
@@ -326,6 +322,15 @@ func (t *TelegramChannel) handleMessage(msg *tgbotapi.Message) {
 			"message_id":  msg.MessageID,
 			"stop_typing": stopTyping, // Pass channel to gateway to stop typing
 		},
+	}
+}
+
+func (t *TelegramChannel) sendInboundReaction(chatID int64, messageID int) {
+	if t == nil || t.bot == nil || chatID == 0 || messageID == 0 {
+		return
+	}
+	if err := t.bot.SetMessageReaction(chatID, messageID, telegramInboundReactionEmoji); err != nil {
+		t.logger.Warnf("[telegram] set inbound reaction failed chat=%d message_id=%d err=%v", chatID, messageID, err)
 	}
 }
 
@@ -419,7 +424,7 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 	if err != nil {
 		return fmt.Errorf("invalid chat id %q: %w", msg.ChatID, err)
 	}
-	event := telegramEvent(msg.Metadata)
+	event := protocol.EventType(msg.Metadata)
 	replyToMessageID := parseReplyToMessageID(msg.ReplyTo)
 
 	// Send media files first (if any)
@@ -446,14 +451,14 @@ func (t *TelegramChannel) Send(msg bus.OutboundMessage) error {
 			}
 		}
 		switch event {
-		case telegramEventPreviewUpdate:
-			return t.sendPreview(chatID, msg.Content, "update", replyToMessageID)
-		case telegramEventPreviewFinal:
-			return t.sendPreview(chatID, msg.Content, "final", replyToMessageID)
-		case telegramEventUsageHUD:
+		case protocol.EventPreviewUpdate:
+			return t.sendOrEditEvent(chatID, msg, replyToMessageID, protocol.EventPreviewUpdate)
+		case protocol.EventPreviewFinal:
+			return t.sendOrEditEvent(chatID, msg, replyToMessageID, protocol.EventPreviewFinal)
+		case protocol.EventUsageHUD:
 			return t.sendUsageHUD(chatID, msg.Content)
-		case telegramEventToolProgress:
-			return t.sendToolProgress(chatID, msg)
+		case protocol.EventToolProgress:
+			return t.sendOrEditEvent(chatID, msg, replyToMessageID, protocol.EventToolProgress)
 		}
 		return t.sendNewMessage(chatID, msg.Content, replyToMessageID)
 	}
@@ -491,14 +496,6 @@ func parseApprovalCallbackData(data string) (action string, approvalID string, o
 	return act, id, true
 }
 
-func telegramEvent(meta map[string]any) string {
-	if len(meta) == 0 {
-		return ""
-	}
-	mode, _ := meta[telegramEventKey].(string)
-	return strings.ToLower(strings.TrimSpace(mode))
-}
-
 func parseReplyToMessageID(raw string) int {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -511,250 +508,37 @@ func parseReplyToMessageID(raw string) int {
 	return id
 }
 
-func (t *TelegramChannel) sendPreview(chatID int64, content, mode string, replyToMessageID int) error {
-	isFinal := mode == "final"
-	if isFinal {
-		return t.finalizePreview(chatID, content)
-	}
-
-	text := renderDraftText(content)
+func (t *TelegramChannel) sendOrEditEvent(chatID int64, msg bus.OutboundMessage, replyToMessageID int, eventType string) error {
+	text := strings.TrimSpace(msg.Content)
 	if text == "" {
 		return nil
 	}
-	text = truncateTelegramText(text, 4000)
-
-	state, err := t.ensureTurnState(chatID, replyToMessageID)
+	requestID := protocol.MetaString(msg.Metadata, protocol.RequestIDKey)
+	if requestID == "" {
+		return fmt.Errorf("missing request_id for outbound_result event=%s", eventType)
+	}
+	targetID := parseReplyToMessageID(protocol.MetaString(msg.Metadata, "message_id"))
+	if targetID > 0 {
+		err := t.editMarkdownMessage(chatID, targetID, text)
+		if err == nil {
+			t.PublishOutboundResult(strconv.FormatInt(chatID, 10), eventType, requestID, strconv.Itoa(targetID))
+			return nil
+		}
+		if eventType == protocol.EventPreviewFinal {
+			if strings.Contains(err.Error(), "message is not modified") {
+				// no-op: content already matches
+			} else {
+				t.logger.Warnf("[telegram] preview_final edit failed, skip fallback request_id=%s err=%v", requestID, err)
+			}
+			return nil
+		}
+		t.logger.Warnf("[telegram] event edit failed event=%s request_id=%s; fallback to send", eventType, requestID)
+	}
+	sentID, err := t.sendMarkdownText(chatID, text, replyToMessageID)
 	if err != nil {
 		return err
 	}
-	if state.lastDraftText == text {
-		return nil
-	}
-
-	edited, err := t.editPreviewText(chatID, state.draftMessageID, text)
-	if err != nil {
-		fallback := tgbotapi.NewMessage(chatID, text)
-		if replyToMessageID > 0 {
-			fallback.ReplyToMessageID = replyToMessageID
-		}
-		m, sendErr := t.bot.Send(fallback)
-		if sendErr != nil {
-			return fmt.Errorf("edit preview: %w; fallback send: %v", err, sendErr)
-		}
-		t.previewMu.Lock()
-		t.previewMsg[chatID] = previewState{
-			draftMessageID: m.MessageID,
-			toolMessageID:  state.toolMessageID,
-			replyToMessageID: state.replyToMessageID,
-			lastDraftText:  text,
-			lastEditAt:     time.Now(),
-			toolBlockIndex: state.toolBlockIndex,
-			toolEntries:    state.toolEntries,
-			hadToolProgress: state.hadToolProgress,
-			finalized:      state.finalized,
-		}
-		t.previewMu.Unlock()
-		return nil
-	}
-	if !edited {
-		return nil
-	}
-
-	t.previewMu.Lock()
-	t.previewMsg[chatID] = previewState{
-		draftMessageID: state.draftMessageID,
-		toolMessageID:  state.toolMessageID,
-		replyToMessageID: state.replyToMessageID,
-		lastDraftText:  text,
-		lastEditAt:     time.Now(),
-		toolBlockIndex: state.toolBlockIndex,
-		toolEntries:    state.toolEntries,
-		hadToolProgress: state.hadToolProgress,
-		finalized:      state.finalized,
-	}
-	t.previewMu.Unlock()
-	return nil
-}
-
-func (t *TelegramChannel) finalizePreview(chatID int64, content string) error {
-	t.previewMu.Lock()
-	state := t.previewMsg[chatID]
-	t.previewMu.Unlock()
-	if state.finalized && state.draftMessageID == 0 {
-		// Idempotent finalization: ignore duplicated final events.
-		return nil
-	}
-
-	ctx := context.Background()
-	const maxUTF16Len = 4090
-	contents, err := telegramify.Telegramify(ctx, content, maxUTF16Len, false, nil)
-	if err != nil {
-		return fmt.Errorf("telegramify process: %w", err)
-	}
-	if len(contents) == 0 {
-		return nil
-	}
-
-	if err := t.applyFinalContents(chatID, state, contents); err != nil {
-		return err
-	}
-
-	// Keep the tool block state after finalization so post-final metadata
-	// (e.g. usage HUD) can still append to the active turn summary.
-	t.previewMu.Lock()
-	cur := t.previewMsg[chatID]
-	if !state.hadToolProgress && state.toolMessageID != 0 {
-		if err := t.bot.DeleteMessage(chatID, state.toolMessageID); err != nil {
-			t.logger.Warnf("[telegram] delete empty tool block failed: %v", err)
-		}
-		cur.toolMessageID = 0
-		cur.toolBlockIndex = 0
-		cur.toolEntries = nil
-		cur.hadToolProgress = false
-	}
-	cur.draftMessageID = 0
-	cur.lastDraftText = ""
-	cur.lastEditAt = time.Now()
-	cur.finalized = true
-	if cur.toolMessageID == 0 && state.toolMessageID != 0 && state.hadToolProgress {
-		cur.toolMessageID = state.toolMessageID
-		cur.toolBlockIndex = state.toolBlockIndex
-		cur.toolEntries = state.toolEntries
-		cur.hadToolProgress = state.hadToolProgress
-	}
-	t.previewMsg[chatID] = cur
-	t.previewMu.Unlock()
-	return nil
-}
-
-func (t *TelegramChannel) applyFinalContents(chatID int64, state previewState, contents []telegramify.Content) error {
-	usedPreview := false
-	for _, item := range contents {
-		replyToMessageID := 0
-		if !usedPreview {
-			replyToMessageID = state.replyToMessageID
-		}
-		switch c := item.(type) {
-		case *telegramify.Text:
-			if !usedPreview && state.draftMessageID != 0 {
-				_, err := t.editPreviewWithTextContent(chatID, state.draftMessageID, c)
-				if err == nil {
-					usedPreview = true
-					continue
-				}
-				t.logger.Warnf("[telegram] preview final edit failed chat=%d err=%v", chatID, err)
-			}
-			if err := t.sendTextContent(chatID, c, replyToMessageID); err != nil {
-				return err
-			}
-			usedPreview = true
-		case *telegramify.File:
-			if !usedPreview && state.draftMessageID != 0 {
-				_, _ = t.bot.EditMessageText(chatID, state.draftMessageID, "已生成附件，正在发送...")
-				usedPreview = true
-			}
-			if err := t.sendFileContent(chatID, c, replyToMessageID); err != nil {
-				return err
-			}
-			usedPreview = true
-		case *telegramify.Photo:
-			if !usedPreview && state.draftMessageID != 0 {
-				_, _ = t.bot.EditMessageText(chatID, state.draftMessageID, "已生成图片，正在发送...")
-				usedPreview = true
-			}
-			if err := t.sendPhotoContent(chatID, c, replyToMessageID); err != nil {
-				return err
-			}
-			usedPreview = true
-		default:
-			t.logger.Warnf("[telegram] unknown content type: %T", item)
-		}
-	}
-	return nil
-}
-
-func (t *TelegramChannel) ensureTurnState(chatID int64, replyToMessageID int) (previewState, error) {
-	t.previewMu.Lock()
-	state, ok := t.previewMsg[chatID]
-	t.previewMu.Unlock()
-	if ok && state.draftMessageID != 0 && state.toolMessageID != 0 {
-		if state.replyToMessageID == 0 && replyToMessageID > 0 {
-			state.replyToMessageID = replyToMessageID
-			t.previewMu.Lock()
-			t.previewMsg[chatID] = state
-			t.previewMu.Unlock()
-		}
-		return state, nil
-	}
-
-	toolMsgID, err := t.sendMarkdownText(chatID, formatToolBlock(1, nil), 0)
-	if err != nil {
-		return previewState{}, fmt.Errorf("send tool block: %w", err)
-	}
-	draft := tgbotapi.NewMessage(chatID, "⌛ 正在生成回复...")
-	if replyToMessageID > 0 {
-		draft.ReplyToMessageID = replyToMessageID
-	}
-	draftMsg, err := t.bot.Send(draft)
-	if err != nil {
-		return previewState{}, fmt.Errorf("send draft block: %w", err)
-	}
-
-	state = previewState{
-		draftMessageID: draftMsg.MessageID,
-		toolMessageID:  toolMsgID,
-		replyToMessageID: replyToMessageID,
-		toolBlockIndex: 1,
-		hadToolProgress: false,
-		finalized:      false,
-	}
-	t.previewMu.Lock()
-	t.previewMsg[chatID] = state
-	t.previewMu.Unlock()
-	return state, nil
-}
-
-func (t *TelegramChannel) sendToolProgress(chatID int64, msg bus.OutboundMessage) error {
-	state, err := t.ensureTurnState(chatID, 0)
-	if err != nil {
-		return err
-	}
-	entry := buildToolEntry(msg)
-	if entry.Name == "" && strings.TrimSpace(entry.Raw) == "" {
-		return nil
-	}
-
-	tryEntries := append(append([]toolEntry{}, state.toolEntries...), entry)
-	block := formatToolBlock(state.toolBlockIndex, tryEntries)
-	if len([]rune(block)) > maxToolBlockChars {
-		// Start a new tool block without dropping old logs.
-		state.toolBlockIndex++
-		state.toolEntries = []toolEntry{entry}
-		newBlock := formatToolBlock(state.toolBlockIndex, state.toolEntries)
-		mID, sendErr := t.sendMarkdownText(chatID, newBlock, 0)
-		if sendErr != nil {
-			return fmt.Errorf("send tool block rollover: %w", sendErr)
-		}
-		state.toolMessageID = mID
-	} else {
-		if err := t.editMarkdownMessage(chatID, state.toolMessageID, block); err != nil {
-			msg := strings.ToLower(err.Error())
-			if !strings.Contains(msg, "message is not modified") {
-				return fmt.Errorf("edit tool block: %w", err)
-			}
-		}
-		state.toolEntries = tryEntries
-	}
-	state.hadToolProgress = true
-
-	t.previewMu.Lock()
-	cur := t.previewMsg[chatID]
-	cur.toolMessageID = state.toolMessageID
-	cur.toolBlockIndex = state.toolBlockIndex
-	cur.toolEntries = state.toolEntries
-	cur.hadToolProgress = state.hadToolProgress
-	t.previewMsg[chatID] = cur
-	t.previewMu.Unlock()
+	t.PublishOutboundResult(strconv.FormatInt(chatID, 10), eventType, requestID, strconv.Itoa(sentID))
 	return nil
 }
 
@@ -774,84 +558,6 @@ func (t *TelegramChannel) sendPlainText(chatID int64, content string) error {
 	}
 	_, err := t.bot.Send(tgbotapi.NewMessage(chatID, text))
 	return err
-}
-
-func formatToolBlock(blockIndex int, entries []toolEntry) string {
-	var b strings.Builder
-	if blockIndex <= 1 {
-		b.WriteString("🧰 Tool Calls")
-	} else {
-		b.WriteString(fmt.Sprintf("🧰 Tool Calls (续 %d)", blockIndex))
-	}
-	if len(entries) == 0 {
-		b.WriteString("\n（等待工具调用）")
-		return b.String()
-	}
-	for _, e := range entries {
-		name := strings.TrimSpace(e.Name)
-		if name == "" {
-			name = "Tool"
-		}
-		payload := normalizeToolPayload(e)
-		if payload == "" {
-			continue
-		}
-		b.WriteString("\n\n⏳ ")
-		b.WriteString(name)
-		b.WriteString("\n```text\n")
-		b.WriteString(payload)
-		b.WriteString("\n```")
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func buildToolEntry(msg bus.OutboundMessage) toolEntry {
-	entry := toolEntry{Raw: strings.TrimSpace(msg.Content)}
-	if msg.Metadata == nil {
-		return entry
-	}
-	if name, ok := msg.Metadata["tool_name"].(string); ok {
-		entry.Name = strings.TrimSpace(name)
-	}
-	if params, ok := msg.Metadata["tool_params"].(string); ok {
-		entry.ParamsRaw = strings.TrimSpace(params)
-	}
-	if when, ok := msg.Metadata["tool_time"].(string); ok {
-		entry.When = strings.TrimSpace(when)
-	}
-	return entry
-}
-
-func normalizeToolPayload(e toolEntry) string {
-	raw := strings.TrimSpace(e.ParamsRaw)
-	if raw == "" || raw == "{}" {
-		raw = strings.TrimSpace(e.Raw)
-	}
-	if raw == "" {
-		return "{}"
-	}
-	if json.Valid([]byte(raw)) {
-		var buf bytes.Buffer
-		if err := json.Compact(&buf, []byte(raw)); err == nil {
-			raw = buf.String()
-		}
-	}
-	raw = strings.ReplaceAll(raw, "```", "'''")
-	return truncateTelegramText(raw, 3400)
-}
-
-func renderDraftText(content string) string {
-	text := strings.TrimSpace(content)
-	if text == "" {
-		return ""
-	}
-	closed := closeOpenMarkdown(text)
-	rendered, _ := telegramify.Convert(closed, false, nil)
-	rendered = strings.TrimSpace(rendered)
-	if rendered == "" {
-		return text
-	}
-	return rendered
 }
 
 func closeOpenMarkdown(s string) string {
@@ -894,7 +600,7 @@ func (t *TelegramChannel) sendPhoto(chatID int64, imagePath string) error {
 	if err != nil {
 		return fmt.Errorf("send telegram photo: %w", err)
 	}
-	
+
 	t.logger.Infof("sent photo to telegram chat_id=%d path=%s", chatID, imagePath)
 	return nil
 }
@@ -934,25 +640,11 @@ func (t *TelegramChannel) sendMediaFile(chatID int64, att api.Attachment) error 
 		}
 	} else if kind == "audio" {
 		voicePath := filePath
-		cleanupVoicePath := func() {}
-		isVoice := strings.HasSuffix(strings.ToLower(filePath), ".ogg") || strings.HasSuffix(strings.ToLower(filePath), ".opus")
-		if !isVoice {
-			convertedPath, convErr := transcodeToTelegramVoice(filePath)
-			if convErr != nil {
-				t.logger.Warnf("[telegram] audio->voice transcode skipped path=%s err=%v", filePath, convErr)
-			} else {
-				voicePath = convertedPath
-				cleanupVoicePath = func() { _ = os.Remove(convertedPath) }
-				t.logger.Infof("[telegram] audio transcoded for voice path=%s converted=%s", filePath, convertedPath)
-			}
-		}
 		voice := tgbotapi.NewVoice(chatID, tgbotapi.FilePath(voicePath))
 		if _, err := t.bot.Send(voice); err == nil {
-			cleanupVoicePath()
 			t.logger.Infof("sent voice to telegram chat_id=%d path=%s", chatID, filePath)
 			return nil
 		}
-		cleanupVoicePath()
 		t.logger.Warnf("[telegram] send voice failed, fallback to audio path=%s", filePath)
 		audio := tgbotapi.NewAudio(chatID, tgbotapi.FilePath(filePath))
 		audio.Caption = filepath.Base(filePath)
@@ -992,14 +684,14 @@ func (t *TelegramChannel) sendMediaFile(chatID int64, att api.Attachment) error 
 // Channel-agnostic Mermaid rendering should be handled by skill layer and sent as image attachments.
 func (t *TelegramChannel) sendNewMessage(chatID int64, content string, replyToMessageID int) error {
 	ctx := context.Background()
-	
+
 	// Process markdown with full pipeline (split, code extraction, Telegram rendering)
 	const maxUTF16Len = 4090 // Leave some margin (Telegram limit is 4096)
 	contents, err := telegramify.Telegramify(ctx, content, maxUTF16Len, false, nil)
 	if err != nil {
 		return fmt.Errorf("telegramify process: %w", err)
 	}
-	
+
 	// Send each content piece in order; only the first piece replies to user message.
 	firstPiece := true
 	for _, item := range contents {
@@ -1025,7 +717,7 @@ func (t *TelegramChannel) sendNewMessage(chatID int64, content string, replyToMe
 			t.logger.Warnf("[telegram] unknown content type: %T", item)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1035,10 +727,10 @@ func (t *TelegramChannel) sendTextContent(chatID int64, text *telegramify.Text, 
 	if replyToMessageID > 0 {
 		tgMsg.ReplyToMessageID = replyToMessageID
 	}
-	
+
 	// Convert MessageEntity to Telegram's format
 	tgMsg.Entities = toTelegramEntities(text.Entities)
-	
+
 	// Send the message
 	if _, err := t.bot.Send(tgMsg); err != nil {
 		// Fallback to plain text if entity parsing fails
@@ -1051,7 +743,7 @@ func (t *TelegramChannel) sendTextContent(chatID int64, text *telegramify.Text, 
 			return fmt.Errorf("send telegram message: %w", err2)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1154,16 +846,16 @@ func (t *TelegramChannel) sendFileContent(chatID int64, file *telegramify.File, 
 		Name:  file.FileName,
 		Bytes: file.FileData,
 	}
-	
+
 	doc := tgbotapi.NewDocument(chatID, fileBytes)
 	if replyToMessageID > 0 {
 		doc.ReplyToMessageID = replyToMessageID
 	}
-	
+
 	// Add caption if present
 	if file.CaptionText != "" {
 		doc.Caption = file.CaptionText
-		
+
 		// Add caption entities
 		if len(file.CaptionEntities) > 0 {
 			tgEntities := make([]tgbotapi.MessageEntity, 0, len(file.CaptionEntities))
@@ -1179,11 +871,11 @@ func (t *TelegramChannel) sendFileContent(chatID int64, file *telegramify.File, 
 			doc.CaptionEntities = tgEntities
 		}
 	}
-	
+
 	if _, err := t.bot.Send(doc); err != nil {
 		return fmt.Errorf("send file: %w", err)
 	}
-	
+
 	t.logger.Debugf("[telegram] sent file: %s", file.FileName)
 	return nil
 }
@@ -1197,16 +889,16 @@ func (t *TelegramChannel) sendPhotoContent(chatID int64, photo *telegramify.Phot
 		Name:  photo.FileName,
 		Bytes: photo.FileData,
 	}
-	
+
 	photoMsg := tgbotapi.NewPhoto(chatID, fileBytes)
 	if replyToMessageID > 0 {
 		photoMsg.ReplyToMessageID = replyToMessageID
 	}
-	
+
 	// Add caption if present
 	if photo.CaptionText != "" {
 		photoMsg.Caption = photo.CaptionText
-		
+
 		// Add caption entities
 		if len(photo.CaptionEntities) > 0 {
 			tgEntities := make([]tgbotapi.MessageEntity, 0, len(photo.CaptionEntities))
@@ -1222,12 +914,11 @@ func (t *TelegramChannel) sendPhotoContent(chatID int64, photo *telegramify.Phot
 			photoMsg.CaptionEntities = tgEntities
 		}
 	}
-	
+
 	if _, err := t.bot.Send(photoMsg); err != nil {
 		return fmt.Errorf("send photo: %w", err)
 	}
-	
+
 	t.logger.Debugf("[telegram] sent photo: %s", photo.FileName)
 	return nil
 }
-

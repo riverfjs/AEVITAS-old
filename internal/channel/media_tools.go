@@ -13,79 +13,12 @@ import (
 
 const audioDurationFallbackMillis = 1000
 
-func localAevitasBinary(name string) string {
-	return filepath.Join(os.Getenv("HOME"), ".aevitas", "bin", name)
-}
-
-func resolveLocalOrSystemBinary(name string) (string, error) {
-	local := localAevitasBinary(name)
-	if _, err := os.Stat(local); err == nil {
-		return local, nil
-	}
-	system, err := exec.LookPath(name)
-	if err != nil {
-		return "", fmt.Errorf("%s not found at %s and not found in PATH", name, local)
-	}
-	return system, nil
-}
-
 func transcodeToTelegramVoice(srcPath string) (string, error) {
-	ffmpegPath, err := resolveLocalOrSystemBinary("ffmpeg")
-	if err != nil {
-		return "", err
-	}
-	tempDir := filepath.Join(os.TempDir(), "aevitas-telegram-media")
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
-		return "", fmt.Errorf("create temp dir: %w", err)
-	}
-	dstPath := filepath.Join(tempDir, fmt.Sprintf("voice-%d.ogg", time.Now().UnixNano()))
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, ffmpegPath,
-		"-y",
-		"-i", srcPath,
-		"-c:a", "libopus",
-		"-b:a", "48k",
-		"-vbr", "on",
-		"-compression_level", "10",
-		"-frame_duration", "60",
-		"-application", "voip",
-		dstPath,
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(dstPath)
-		return "", fmt.Errorf("ffmpeg transcode failed: %v output=%s", err, strings.TrimSpace(string(out)))
-	}
-	return dstPath, nil
+	return transcodeWithOpus(srcPath, "aevitas-telegram-media", "voice", "ogg", true)
 }
 
 func transcodeToFeishuOpus(srcPath string) (string, error) {
-	ffmpegPath, err := resolveLocalOrSystemBinary("ffmpeg")
-	if err != nil {
-		return "", err
-	}
-	tempDir := filepath.Join(os.TempDir(), "aevitas-feishu-media")
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
-		return "", fmt.Errorf("create temp dir: %w", err)
-	}
-	dstPath := filepath.Join(tempDir, fmt.Sprintf("audio-%d.opus", time.Now().UnixNano()))
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, ffmpegPath,
-		"-y",
-		"-i", srcPath,
-		"-c:a", "libopus",
-		"-b:a", "48k",
-		"-vbr", "on",
-		"-compression_level", "10",
-		"-application", "voip",
-		dstPath,
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(dstPath)
-		return "", fmt.Errorf("ffmpeg opus transcode failed: %v output=%s", err, strings.TrimSpace(string(out)))
-	}
-	return dstPath, nil
+	return transcodeWithOpus(srcPath, "aevitas-feishu-media", "audio", "opus", false)
 }
 
 func detectAudioDurationMillis(mediaPath string) int {
@@ -114,4 +47,57 @@ func detectAudioDurationMillis(mediaPath string) int {
 		return audioDurationFallbackMillis
 	}
 	return ms
+}
+
+func resolveLocalOrSystemBinary(name string) (string, error) {
+	local := filepath.Join(os.Getenv("HOME"), ".aevitas", "bin", name)
+	if _, err := os.Stat(local); err == nil {
+		return local, nil
+	}
+	system, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("%s not found at %s and not found in PATH", name, local)
+	}
+	return system, nil
+}
+
+func transcodeWithOpus(srcPath, tempDirName, filePrefix, fileExt string, frameDuration bool) (string, error) {
+	ffmpegPath, err := resolveLocalOrSystemBinary("ffmpeg")
+	if err != nil {
+		return "", err
+	}
+	tempDir := filepath.Join(os.TempDir(), tempDirName)
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	dstPath := filepath.Join(tempDir, fmt.Sprintf("%s-%d.%s", filePrefix, time.Now().UnixNano(), strings.TrimPrefix(fileExt, ".")))
+	args := []string{
+		"-y",
+		"-i", srcPath,
+		"-c:a", "libopus",
+		"-b:a", "48k",
+		"-vbr", "on",
+		"-compression_level", "10",
+	}
+	if frameDuration {
+		args = append(args, "-frame_duration", "60")
+	}
+	args = append(args, "-application", "voip", dstPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		_ = os.Remove(dstPath)
+		return "", fmt.Errorf("ffmpeg opus transcode failed: %v output=%s", err, strings.TrimSpace(string(out)))
+	}
+	return dstPath, nil
+}
+
+// Gateway wrappers: keep gateway unified while reusing channel media toolkit.
+func TranscodeToFeishuOpusForGateway(srcPath string) (string, error) {
+	return transcodeToFeishuOpus(srcPath)
+}
+
+func DetectAudioDurationMillisForGateway(mediaPath string) int {
+	return detectAudioDurationMillis(mediaPath)
 }

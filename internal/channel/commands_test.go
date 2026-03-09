@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -519,7 +520,11 @@ func TestCommandHandler_HandleRestart_PreparesTrigger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read trigger: %v", err)
 	}
-	if strings.TrimSpace(string(data)) != "feishu:oc_123" {
+	var triggerData map[string]string
+	if err := json.Unmarshal(data, &triggerData); err != nil {
+		t.Fatalf("parse trigger json: %v", err)
+	}
+	if triggerData["channel"] != "feishu" || triggerData["chat_id"] != "oc_123" {
 		t.Fatalf("unexpected trigger content: %q", string(data))
 	}
 }

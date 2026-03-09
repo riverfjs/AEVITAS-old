@@ -5,6 +5,7 @@ import (
 	"github.com/riverfjs/agentsdk-go/pkg/api"
 	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	"github.com/riverfjs/agentsdk-go/pkg/model"
+	"github.com/riverfjs/agentsdk-go/pkg/tool"
 )
 
 func NewProvider(cfg *config.Config) api.ModelFactory {
@@ -26,7 +27,7 @@ func NewProvider(cfg *config.Config) api.ModelFactory {
 	}
 }
 
-func BuildAPIOptions(cfg *config.Config, provider api.ModelFactory, sysPrompt string, log sdklogger.Logger, realtimeCallback func(api.RealtimeEvent), permissionHandler api.PermissionRequestHandler) api.Options {
+func BuildAPIOptions(cfg *config.Config, provider api.ModelFactory, sysPrompt string, log sdklogger.Logger, realtimeCallback func(api.RealtimeEvent), permissionHandler api.PermissionRequestHandler, customTools []tool.Tool) api.Options {
 	inputGuardEnabled := cfg.Agent.Guard.InputEnabled
 	outputGuardEnabled := cfg.Agent.Guard.OutputEnabled
 	var promptGuardFactory api.ModelFactory
@@ -82,6 +83,7 @@ func BuildAPIOptions(cfg *config.Config, provider api.ModelFactory, sysPrompt st
 		ContextWindowTokens:        cfg.Agent.ContextWindow.Tokens,
 		ContextWindowWarnRatio:     cfg.Agent.ContextWindow.WarnRatio,
 		ContextWindowHardMinTokens: cfg.Agent.ContextWindow.HardMinTokens,
+		CustomTools:                customTools,
 		MemoryFlush: api.MemoryFlushConfig{
 			Enabled:             cfg.Agent.MemoryFlush.Enabled,
 			ReserveTokensFloor:  cfg.Agent.MemoryFlush.ReserveTokensFloor,

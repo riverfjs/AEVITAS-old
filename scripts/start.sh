@@ -8,6 +8,9 @@ NOHUP_LOG="${HOME}/.aevitas/workspace/logs/nohup.out"
 PID_FILE="${HOME}/.aevitas/aevitas.pid"
 MAX_NOHUP_MB="${MAX_NOHUP_MB:-20}"
 
+ts() { date "+%Y-%m-%dT%H:%M:%S%z"; }
+echo "[$(ts)] [start.sh] begin"
+
 # Check if binary exists
 if [ ! -f "$AEVITAS_BIN" ]; then
     echo "Error: aevitas binary not found at $AEVITAS_BIN"
@@ -15,20 +18,33 @@ if [ ! -f "$AEVITAS_BIN" ]; then
     exit 1
 fi
 
-# Check if already running
+# Idempotent start guard: if gateway is already running, do not spawn again.
 if [ -f "$PID_FILE" ]; then
-    PID=$(cat "$PID_FILE")
-    if ps -p "$PID" > /dev/null 2>&1; then
-        echo "aevitas gateway is already running (PID: $PID)"
-        exit 1
-    else
-        # Stale PID file, remove it
-        rm -f "$PID_FILE"
+    EXISTING_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    case "$EXISTING_PID" in
+        ''|*[!0-9]*) EXISTING_PID="" ;;
+    esac
+    if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        echo "aevitas gateway already running (PID: $EXISTING_PID)"
+        echo "[$(ts)] [start.sh] already running pid=$EXISTING_PID, skip start"
+        exit 0
     fi
+    rm -f "$PID_FILE"
+    echo "[$(ts)] [start.sh] removed stale pid file: $PID_FILE"
+fi
+
+# Fallback guard: pid file may be missing but gateway process still running.
+EXISTING_GATEWAY_PID="$(pgrep -f "\\.aevitas/bin/aevitas gateway" | head -n 1 || true)"
+if [ -n "$EXISTING_GATEWAY_PID" ]; then
+    echo "aevitas gateway already running (PID: $EXISTING_GATEWAY_PID)"
+    echo "$EXISTING_GATEWAY_PID" > "$PID_FILE"
+    echo "[$(ts)] [start.sh] detected running gateway without pid file, restored pid file"
+    exit 0
 fi
 
 # Ensure log directory exists
 mkdir -p "$(dirname "$NOHUP_LOG")"
+echo "[$(ts)] [start.sh] ensured log dir: $(dirname "$NOHUP_LOG")"
 
 # Rotate nohup log when it grows too large.
 # Keep one backup: nohup.out.1
@@ -54,8 +70,20 @@ PID=$!
 
 # Save PID
 echo "$PID" > "$PID_FILE"
+echo "[$(ts)] [start.sh] gateway spawned pid=$PID nohup_log=$NOHUP_LOG"
+
+# Verify gateway is still alive shortly after spawn.
+sleep 1
+if ! kill -0 "$PID" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    echo "[$(ts)] [start.sh] gateway exited early pid=$PID"
+    echo "Error: aevitas gateway failed to stay running. Check: $NOHUP_LOG"
+    exit 1
+fi
 
 echo "aevitas gateway started (PID: $PID)"
 echo "Main logs: ~/.aevitas/workspace/logs/aevitas.log"
 echo "Startup logs: $NOHUP_LOG"
+
+echo "[$(ts)] [start.sh] done"
 

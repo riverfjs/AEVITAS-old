@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/riverfjs/aevitas/internal/config"
 	"github.com/riverfjs/agentsdk-go/pkg/api"
 	"github.com/spf13/cobra"
-	"github.com/riverfjs/aevitas/internal/config"
 )
 
 func TestWriteIfNotExists_NewFile(t *testing.T) {
@@ -223,14 +223,14 @@ func TestRunStatus(t *testing.T) {
 	if !strings.Contains(output, "API Key: not set") {
 		t.Errorf("missing API Key info in output: %s", output)
 	}
-	if !strings.Contains(output, "Telegram: enabled=") {
-		t.Errorf("missing Telegram status in output: %s", output)
+	if !strings.Contains(output, "Channel[telegram]: enabled=") {
+		t.Errorf("missing telegram status in output: %s", output)
 	}
-	if !strings.Contains(output, "Feishu: enabled=") {
-		t.Errorf("missing Feishu status in output: %s", output)
+	if !strings.Contains(output, "Channel[interaction]: enabled=") {
+		t.Errorf("missing interaction status in output: %s", output)
 	}
-	if !strings.Contains(output, "WeCom: enabled=") {
-		t.Errorf("missing WeCom status in output: %s", output)
+	if !strings.Contains(output, "Channel[wecom]: enabled=") {
+		t.Errorf("missing wecom status in output: %s", output)
 	}
 }
 

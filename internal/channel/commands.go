@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,6 +33,11 @@ type CommandHandler struct {
 	contextWindowTokens int
 }
 
+type restartTrigger struct {
+	Channel string `json:"channel"`
+	ChatID  string `json:"chat_id"`
+}
+
 // NewCommandHandler creates a new command handler
 func NewCommandHandler(runtime SessionResetter, workspace string, contextWindowTokens int) *CommandHandler {
 	return &CommandHandler{
@@ -53,7 +59,7 @@ type CommandResult struct {
 // HandleCommand processes special commands and returns whether it was handled.
 func (h *CommandHandler) HandleCommand(msg bus.InboundMessage) CommandResult {
 	content := strings.TrimSpace(msg.Content)
-	
+
 	// Check if it's a command (starts with /)
 	if !strings.HasPrefix(content, "/") {
 		return CommandResult{Handled: false}
@@ -70,12 +76,12 @@ func (h *CommandHandler) HandleCommand(msg bus.InboundMessage) CommandResult {
 	switch command {
 	case "/start":
 		return CommandResult{
-			Handled: true,
+			Handled:  true,
 			Response: h.handleStart(),
 		}
 	case "/help":
 		return CommandResult{
-			Handled: true,
+			Handled:  true,
 			Response: h.handleHelp(),
 		}
 	case "/reset":
@@ -91,25 +97,35 @@ func (h *CommandHandler) HandleCommand(msg bus.InboundMessage) CommandResult {
 				Response: resp,
 			}
 		}
-		// Save chat info for post-restart notification.
-		restartInfo := fmt.Sprintf("%s:%s", msg.Channel, msg.ChatID)
-		restartTriggerFile := filepath.Join(os.Getenv("HOME"), ".aevitas", "restart_trigger.txt")
+		// Save restart target for post-restart notification.
+		restartInfo := restartTrigger{
+			Channel: strings.TrimSpace(msg.Channel),
+			ChatID:  strings.TrimSpace(msg.ChatID),
+		}
+		restartTriggerFile := RestartTriggerFilePath()
 		if err := os.MkdirAll(filepath.Dir(restartTriggerFile), 0755); err != nil {
 			return CommandResult{
 				Handled:  true,
 				Response: fmt.Sprintf("❌ Failed to prepare restart: %v", err),
 			}
 		}
-		if err := os.WriteFile(restartTriggerFile, []byte(restartInfo), 0644); err != nil {
+		raw, err := json.Marshal(restartInfo)
+		if err != nil {
+			return CommandResult{
+				Handled:  true,
+				Response: fmt.Sprintf("❌ Failed to prepare restart: %v", err),
+			}
+		}
+		if err := os.WriteFile(restartTriggerFile, raw, 0644); err != nil {
 			return CommandResult{
 				Handled:  true,
 				Response: fmt.Sprintf("❌ Failed to prepare restart: %v", err),
 			}
 		}
 		return CommandResult{
-			Handled: true,
+			Handled:  true,
 			Response: resp,
-			Restart: true,
+			Restart:  true,
 		}
 	case "/logs":
 		// Parse argument: number or "all"
@@ -120,7 +136,7 @@ func (h *CommandHandler) HandleCommand(msg bus.InboundMessage) CommandResult {
 		return h.handleLogs(arg)
 	case "/status":
 		return CommandResult{
-			Handled: true,
+			Handled:  true,
 			Response: h.handleStatus(),
 		}
 	case "/usage":
@@ -163,19 +179,19 @@ func (h *CommandHandler) HandleCommand(msg bus.InboundMessage) CommandResult {
 		// Handle /skill list
 		if len(parts) > 1 && strings.ToLower(parts[1]) == "list" {
 			return CommandResult{
-				Handled: true,
+				Handled:  true,
 				Response: h.handleSkillList(),
 			}
 		}
 		// Unknown /skill subcommand
 		return CommandResult{
-			Handled: true,
+			Handled:  true,
 			Response: "❓ Unknown command. Use `/skill list` to see available skills.",
 		}
 	default:
 		// Unknown command - return friendly message instead of passing to agent
 		return CommandResult{
-			Handled: true,
+			Handled:  true,
 			Response: fmt.Sprintf("❓ Unknown command: %s\n\nUse /help to see available commands.", command),
 		}
 	}
@@ -229,7 +245,6 @@ func (h *CommandHandler) handleReset(sessionKey string) string {
 	return "✅ **Session Reset**\n\nLet's start fresh!"
 }
 
-
 func (h *CommandHandler) handleSkillList() string {
 	if h.workspace == "" {
 		return "⚠️ Skill listing is not available (workspace not configured)"
@@ -280,12 +295,12 @@ func (h *CommandHandler) handleUsage(sessionKey, mode string) string {
 }
 
 func (h *CommandHandler) RestartScriptPath() string {
-	return filepath.Join(os.Getenv("HOME"), ".aevitas", "bin", "..", "..", "Documents", "chatbot", "aevitas", "scripts", "restart.sh")
+	return filepath.Join(os.Getenv("HOME"), ".aevitas", "scripts", "restart.sh")
 }
 
 func (h *CommandHandler) handleRestart() (string, bool) {
 	scriptPath := h.RestartScriptPath()
-	
+
 	// Check if restart script exists
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
 		return "⚠️ Restart script not found. This command only works in production mode.\n\nUse `make prod` to install and `scripts/start.sh` to run in background.", false
@@ -297,7 +312,7 @@ func (h *CommandHandler) handleRestart() (string, bool) {
 func (h *CommandHandler) handleLogs(arg string) CommandResult {
 	// Always use home directory for logs in production
 	logFile := filepath.Join(os.Getenv("HOME"), ".aevitas", "workspace", "logs", "aevitas.log")
-	
+
 	// Check if log file exists
 	if _, err := os.Stat(logFile); os.IsNotExist(err) {
 		return CommandResult{
@@ -305,15 +320,15 @@ func (h *CommandHandler) handleLogs(arg string) CommandResult {
 			Response: "⚠️ Log file not found at: " + logFile,
 		}
 	}
-	
+
 	// Check if user wants full file
 	if arg == "all" {
 		return CommandResult{
-			Handled:  true,
-			Files:    []string{logFile},
+			Handled: true,
+			Files:   []string{logFile},
 		}
 	}
-	
+
 	// Parse number of lines (default 100)
 	lines := 100
 	if n, err := strconv.Atoi(arg); err == nil && n > 0 {
@@ -323,7 +338,7 @@ func (h *CommandHandler) handleLogs(arg string) CommandResult {
 			lines = n
 		}
 	}
-	
+
 	// Read last N lines
 	content, err := readLastLines(logFile, lines)
 	if err != nil {
@@ -332,7 +347,7 @@ func (h *CommandHandler) handleLogs(arg string) CommandResult {
 			Response: fmt.Sprintf("❌ Failed to read log file: %v", err),
 		}
 	}
-	
+
 	exportDir := filepath.Join(os.TempDir(), "aevitas-logs")
 	if err := os.MkdirAll(exportDir, 0755); err != nil {
 		return CommandResult{
@@ -347,10 +362,10 @@ func (h *CommandHandler) handleLogs(arg string) CommandResult {
 			Response: fmt.Sprintf("❌ Failed to write log export: %v", err),
 		}
 	}
-	
+
 	return CommandResult{
-		Handled:  true,
-		Files:    []string{exportPath},
+		Handled: true,
+		Files:   []string{exportPath},
 	}
 }
 
@@ -361,47 +376,47 @@ func readLastLines(filePath string, n int) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	
+
 	// Get file size
 	stat, err := file.Stat()
 	if err != nil {
 		return "", err
 	}
 	fileSize := stat.Size()
-	
+
 	// Read file in chunks from the end
 	const bufSize = 4096
 	var lines []string
 	var buffer []byte
-	
+
 	for offset := fileSize; offset > 0 && len(lines) < n; {
 		// Calculate chunk size
 		chunkSize := int64(bufSize)
 		if offset < chunkSize {
 			chunkSize = offset
 		}
-		
+
 		// Seek to position
 		offset -= chunkSize
 		_, err := file.Seek(offset, 0)
 		if err != nil {
 			return "", err
 		}
-		
+
 		// Read chunk
 		chunk := make([]byte, chunkSize)
 		_, err = file.Read(chunk)
 		if err != nil {
 			return "", err
 		}
-		
+
 		// Prepend to buffer
 		buffer = append(chunk, buffer...)
-		
+
 		// Split into lines
 		text := string(buffer)
 		allLines := strings.Split(text, "\n")
-		
+
 		// If we're not at the beginning of the file, keep incomplete first line in buffer
 		if offset > 0 && len(allLines) > 0 {
 			buffer = []byte(allLines[0])
@@ -409,49 +424,49 @@ func readLastLines(filePath string, n int) (string, error) {
 		} else {
 			buffer = nil
 		}
-		
+
 		// Prepend lines
 		lines = append(allLines, lines...)
 	}
-	
+
 	// Get last n lines
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
-	
+
 	// Remove empty trailing line
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	
+
 	return strings.Join(lines, "\n"), nil
 }
 
 func (h *CommandHandler) handleStatus() string {
 	pidFile := filepath.Join(os.Getenv("HOME"), ".aevitas", "aevitas.pid")
-	
+
 	// Check if PID file exists
 	if _, err := os.Stat(pidFile); os.IsNotExist(err) {
 		// Maybe running in foreground, show current process PID
 		currentPID := os.Getpid()
 		return fmt.Sprintf("🟡 **Gateway Status: Running (Foreground)**\n\nCurrent PID: %d\n\nNo PID file found - gateway may be running in foreground mode.", currentPID)
 	}
-	
+
 	// Read PID
 	pidBytes, err := os.ReadFile(pidFile)
 	if err != nil {
 		return fmt.Sprintf("⚠️ Failed to read PID file: %v", err)
 	}
-	
+
 	pid := strings.TrimSpace(string(pidBytes))
-	
+
 	// Check if process is running
 	cmd := exec.Command("ps", "-p", pid, "-o", "pid,etime,command")
 	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Sprintf("🔴 **Gateway Status: Not Running**\n\nStale PID file found (PID: %s)\n\nUse `make start` or `/restart` to start.", pid)
 	}
-	
+
 	// Parse ps output to get uptime
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	var uptime string
@@ -461,12 +476,12 @@ func (h *CommandHandler) handleStatus() string {
 			uptime = fields[1] // ELAPSED time
 		}
 	}
-	
+
 	statusMsg := fmt.Sprintf("🟢 **Gateway Status: Running (Background)**\n\nPID: %s", pid)
 	if uptime != "" {
 		statusMsg += fmt.Sprintf("\nUptime: %s", uptime)
 	}
-	
+
 	return statusMsg
 }
 
@@ -606,11 +621,15 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 			Response: "✨ **No Temporary Files Found**\n\nYour system is clean!",
 		}
 	}
-	
+
 	// Get oldest and newest file times
 	var oldestTime, newestTime int64
 	for _, file := range tempFiles {
-		info, _ := os.Stat(file)
+		info, err := os.Stat(file)
+		if err != nil || info == nil {
+			// File may be removed between scan and stat; skip safely.
+			continue
+		}
 		modTime := info.ModTime().Unix()
 		if oldestTime == 0 || modTime < oldestTime {
 			oldestTime = modTime
@@ -619,7 +638,7 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 			newestTime = modTime
 		}
 	}
-	
+
 	// Save pending cleanup list to temp file
 	cleanupFile := filepath.Join(os.TempDir(), fmt.Sprintf("cleanup_%s.txt", chatID))
 	var lines []string
@@ -633,7 +652,7 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 			Response: fmt.Sprintf("❌ Failed to save cleanup list: %v", err),
 		}
 	}
-	
+
 	// Format response
 	response := "🗑️ **Temporary Files Found**\n\n"
 	response += "📊 Statistics:\n"
@@ -650,7 +669,7 @@ func (h *CommandHandler) handleCleanupScan(chatID string) CommandResult {
 	response += "• `/cleanup confirm temp`\n"
 	response += "• `/cleanup confirm tts`\n"
 	response += "• `/cleanup confirm var`"
-	
+
 	return CommandResult{
 		Handled:  true,
 		Response: response,
@@ -686,7 +705,7 @@ func (h *CommandHandler) handleCleanupConfirm(chatID, scope string) CommandResul
 			Response: "⚠️ No pending cleanup request found or it has expired.\n\nUse `/cleanup` to scan for temporary files first.",
 		}
 	}
-	
+
 	rawLines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	if len(rawLines) == 0 {
 		return CommandResult{
@@ -719,11 +738,11 @@ func (h *CommandHandler) handleCleanupConfirm(chatID, scope string) CommandResul
 			Response: "⚠️ No files to clean.",
 		}
 	}
-	
+
 	// Delete files
 	deletedCount := 0
 	var failedFiles []string
-	
+
 	for _, entry := range entries {
 		if entry.path == "" {
 			continue
@@ -737,19 +756,18 @@ func (h *CommandHandler) handleCleanupConfirm(chatID, scope string) CommandResul
 			deletedCount++
 		}
 	}
-	
+
 	// Remove cleanup list file
 	os.Remove(cleanupFile)
-	
+
 	// Format response
 	response := fmt.Sprintf("✅ **Cleanup Complete**\n\nScope: %s\nDeleted %d file(s)", scope, deletedCount)
 	if len(failedFiles) > 0 {
 		response += fmt.Sprintf("\n\n⚠️ Failed to delete %d file(s):\n%s", len(failedFiles), strings.Join(failedFiles, ", "))
 	}
-	
+
 	return CommandResult{
 		Handled:  true,
 		Response: response,
 	}
 }
-

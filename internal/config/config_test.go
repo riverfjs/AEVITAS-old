@@ -363,3 +363,33 @@ func TestLoadConfig_WeComEnvOverrides(t *testing.T) {
 		t.Errorf("wecom receiveId = %q, want wecom-receive-id", cfg.Channels.WeCom.ReceiveID)
 	}
 }
+
+func TestEnabledChannels_Explicit(t *testing.T) {
+	cfg := &Config{
+		Channels: ChannelsConfig{
+			Telegram:    TelegramConfig{Enabled: true},
+			WeCom:       WeComConfig{Enabled: false},
+			Interaction: InteractionConfig{Enabled: true},
+		},
+	}
+
+	channels := cfg.EnabledChannels()
+	if channels["telegram"] != true || channels["interaction"] != true || channels["wecom"] != false {
+		t.Fatalf("unexpected channels status: %#v", channels)
+	}
+}
+
+func TestPluginPaths_DefaultAndOverride(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.PluginHomeDir() == "" || cfg.PluginRegistryPath() == "" {
+		t.Fatal("plugin paths should not be empty")
+	}
+	cfg.Plugins.Home = "/tmp/aevitas-plugins"
+	cfg.Plugins.Registry = "/tmp/aevitas-plugins/custom-registry.json"
+	if cfg.PluginHomeDir() != "/tmp/aevitas-plugins" {
+		t.Fatalf("PluginHomeDir = %q", cfg.PluginHomeDir())
+	}
+	if cfg.PluginRegistryPath() != "/tmp/aevitas-plugins/custom-registry.json" {
+		t.Fatalf("PluginRegistryPath = %q", cfg.PluginRegistryPath())
+	}
+}

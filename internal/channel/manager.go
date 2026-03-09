@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 )
 
 var (
@@ -37,7 +37,10 @@ type ChannelState struct {
 	LastSuccess time.Time
 }
 
-func NewChannelManager(cfg config.ChannelsConfig, b *bus.MessageBus, logger sdklogger.Logger) (*ChannelManager, error) {
+func NewChannelManager(cfg *config.Config, b *bus.MessageBus, logger sdklogger.Logger) (*ChannelManager, error) {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	m := &ChannelManager{
 		channels: make(map[string]Channel),
 		logger:   logger,
@@ -45,8 +48,8 @@ func NewChannelManager(cfg config.ChannelsConfig, b *bus.MessageBus, logger sdkl
 	}
 	m.readyCond = sync.NewCond(&m.mu)
 
-	if cfg.Telegram.Enabled {
-		ch, err := NewTelegramChannel(cfg.Telegram, b, logger)
+	if cfg.Channels.Telegram.Enabled {
+		ch, err := NewTelegramChannel(cfg.Channels.Telegram, b, logger)
 		if err != nil {
 			return nil, fmt.Errorf("init telegram channel: %w", err)
 		}
@@ -59,10 +62,10 @@ func NewChannelManager(cfg config.ChannelsConfig, b *bus.MessageBus, logger sdkl
 		})
 	}
 
-	if cfg.Feishu.Enabled {
-		ch, err := NewFeishuChannel(cfg.Feishu, b, logger)
+	if cfg.Channels.WeCom.Enabled {
+		ch, err := NewWeComChannel(cfg.Channels.WeCom, b, logger)
 		if err != nil {
-			return nil, fmt.Errorf("init feishu channel: %w", err)
+			return nil, fmt.Errorf("init wecom channel: %w", err)
 		}
 		m.channels[ch.Name()] = ch
 		m.states[ch.Name()] = ChannelState{}
@@ -73,10 +76,10 @@ func NewChannelManager(cfg config.ChannelsConfig, b *bus.MessageBus, logger sdkl
 		})
 	}
 
-	if cfg.WeCom.Enabled {
-		ch, err := NewWeComChannel(cfg.WeCom, b, logger)
+	if cfg.Channels.Interaction.Enabled {
+		ch, err := NewInteractionChannel(cfg.Channels.Interaction, b, logger)
 		if err != nil {
-			return nil, fmt.Errorf("init wecom channel: %w", err)
+			return nil, fmt.Errorf("init interaction channel: %w", err)
 		}
 		m.channels[ch.Name()] = ch
 		m.states[ch.Name()] = ChannelState{}
@@ -158,6 +161,18 @@ func (m *ChannelManager) SendNow(msg bus.OutboundMessage) error {
 		return fmt.Errorf("channel not found: %s", channelName)
 	}
 	return ch.Send(msg)
+}
+
+func (m *ChannelManager) InvokeInteractionTool(ctx context.Context, sessionChatID, toolName string, params map[string]any) (map[string]any, error) {
+	ch, ok := m.channels[interactionChannelName]
+	if !ok || ch == nil {
+		return nil, fmt.Errorf("channel not found: %s", interactionChannelName)
+	}
+	ich, ok := ch.(*InteractionChannel)
+	if !ok {
+		return nil, fmt.Errorf("channel %s type mismatch", interactionChannelName)
+	}
+	return ich.InvokeTool(ctx, sessionChatID, toolName, params)
 }
 
 func (m *ChannelManager) ChannelStates() map[string]ChannelState {

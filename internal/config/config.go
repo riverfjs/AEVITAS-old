@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 )
 
 const (
@@ -21,6 +23,7 @@ const (
 type Config struct {
 	Agent    AgentConfig    `json:"agent"`
 	Channels ChannelsConfig `json:"channels"`
+	Plugins  PluginsConfig  `json:"plugins,omitempty"`
 	Provider ProviderConfig `json:"provider"`
 	Voice    VoiceConfig    `json:"voice,omitempty"`
 	Tools    ToolsConfig    `json:"tools"`
@@ -28,11 +31,11 @@ type Config struct {
 }
 
 type AgentConfig struct {
-	Workspace         string  `json:"workspace"`
+	Workspace         string      `json:"workspace"`
 	Model             ModelConfig `json:"model"`
-	MaxTokens         int     `json:"maxTokens"`
-	Temperature       float64 `json:"temperature"`
-	MaxToolIterations int     `json:"maxToolIterations"`
+	MaxTokens         int         `json:"maxTokens"`
+	Temperature       float64     `json:"temperature"`
+	MaxToolIterations int         `json:"maxToolIterations"`
 	// HistoryLimit caps the number of user turns loaded from disk into each
 	// session context. 0 = no limit (all history). Default: 30.
 	HistoryLimit int `json:"historyLimit,omitempty"`
@@ -188,9 +191,9 @@ type ProviderConfig struct {
 }
 
 type VoiceConfig struct {
-	Enabled bool            `json:"enabled"`
-	ASR     VoiceASRConfig  `json:"asr,omitempty"`
-	TTS     VoiceTTSConfig  `json:"tts,omitempty"`
+	Enabled bool           `json:"enabled"`
+	ASR     VoiceASRConfig `json:"asr,omitempty"`
+	TTS     VoiceTTSConfig `json:"tts,omitempty"`
 }
 
 type VoiceASRConfig struct {
@@ -216,9 +219,125 @@ type VoiceTTSConfig struct {
 }
 
 type ChannelsConfig struct {
-	Telegram TelegramConfig `json:"telegram"`
-	Feishu   FeishuConfig   `json:"feishu"`
-	WeCom    WeComConfig    `json:"wecom"`
+	Telegram    TelegramConfig    `json:"telegram"`
+	WeCom       WeComConfig       `json:"wecom"`
+	Interaction InteractionConfig `json:"interaction"`
+	Plugin      map[string]any    `json:"-"`
+}
+
+type PluginsConfig struct {
+	Home     string                  `json:"home,omitempty"`
+	Registry string                  `json:"registry,omitempty"`
+	Entries  map[string]PluginConfig `json:"-"`
+}
+
+type PluginConfig struct {
+	Enabled bool               `json:"enabled"`
+	Source  PluginSourceConfig `json:"source,omitempty"`
+}
+
+func (c *ChannelsConfig) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Telegram    TelegramConfig    `json:"telegram"`
+		WeCom       WeComConfig       `json:"wecom"`
+		Interaction InteractionConfig `json:"interaction"`
+	}
+	var known alias
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	delete(raw, "telegram")
+	delete(raw, "wecom")
+	delete(raw, "interaction")
+	c.Telegram = known.Telegram
+	c.WeCom = known.WeCom
+	c.Interaction = known.Interaction
+	c.Plugin = raw
+	return nil
+}
+
+func (c ChannelsConfig) MarshalJSON() ([]byte, error) {
+	out := map[string]any{
+		"telegram":    c.Telegram,
+		"wecom":       c.WeCom,
+		"interaction": c.Interaction,
+	}
+	for k, v := range c.Plugin {
+		trimmed := strings.TrimSpace(k)
+		if trimmed == "" {
+			continue
+		}
+		out[trimmed] = v
+	}
+	return json.Marshal(out)
+}
+
+func (p *PluginsConfig) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Home     string `json:"home,omitempty"`
+		Registry string `json:"registry,omitempty"`
+	}
+	var known alias
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	delete(raw, "home")
+	delete(raw, "registry")
+	entries := map[string]PluginConfig{}
+	for k, v := range raw {
+		trimmed := strings.TrimSpace(k)
+		if trimmed == "" {
+			continue
+		}
+		var cfg PluginConfig
+		if err := json.Unmarshal(v, &cfg); err != nil {
+			return fmt.Errorf("parse plugins.%s: %w", trimmed, err)
+		}
+		entries[trimmed] = cfg
+	}
+	p.Home = known.Home
+	p.Registry = known.Registry
+	p.Entries = entries
+	return nil
+}
+
+func (p PluginsConfig) MarshalJSON() ([]byte, error) {
+	out := map[string]any{}
+	if strings.TrimSpace(p.Home) != "" {
+		out["home"] = p.Home
+	}
+	if strings.TrimSpace(p.Registry) != "" {
+		out["registry"] = p.Registry
+	}
+	for k, v := range p.Entries {
+		trimmed := strings.TrimSpace(k)
+		if trimmed == "" {
+			continue
+		}
+		out[trimmed] = v
+	}
+	return json.Marshal(out)
+}
+
+func (p PluginsConfig) Entry(pluginID string) (PluginConfig, bool) {
+	if p.Entries == nil {
+		return PluginConfig{}, false
+	}
+	cfg, ok := p.Entries[strings.TrimSpace(pluginID)]
+	return cfg, ok
+}
+
+type PluginSourceConfig struct {
+	NpmSpec string `json:"npmSpec,omitempty"`
+	Tarball string `json:"tarball,omitempty"`
 }
 
 type TelegramConfig struct {
@@ -228,13 +347,6 @@ type TelegramConfig struct {
 	Proxy     string   `json:"proxy,omitempty"`
 }
 
-type FeishuConfig struct {
-	Enabled   bool     `json:"enabled"`
-	AppID     string   `json:"appId"`
-	AppSecret string   `json:"appSecret"`
-	AllowFrom []string `json:"allowFrom"`
-}
-
 type WeComConfig struct {
 	Enabled        bool     `json:"enabled"`
 	Token          string   `json:"token"`
@@ -242,6 +354,16 @@ type WeComConfig struct {
 	ReceiveID      string   `json:"receiveId,omitempty"`
 	Port           int      `json:"port,omitempty"`
 	AllowFrom      []string `json:"allowFrom"`
+}
+
+type InteractionConfig struct {
+	Enabled           bool     `json:"enabled"`
+	ListenAddr        string   `json:"listenAddr,omitempty"`
+	InboundPath       string   `json:"inboundPath,omitempty"`
+	OutboundURL       string   `json:"outboundUrl,omitempty"`
+	AuthToken         string   `json:"authToken,omitempty"`
+	RequestTimeoutSec int      `json:"requestTimeoutSec,omitempty"`
+	AllowFrom         []string `json:"allowFrom"`
 }
 
 type ToolsConfig struct {
@@ -294,6 +416,7 @@ func DefaultConfig() *Config {
 			},
 		},
 		Channels: ChannelsConfig{},
+		Plugins: PluginsConfig{},
 		Tools: ToolsConfig{
 			ExecTimeout:         DefaultExecTimeout,
 			RestrictToWorkspace: true,
@@ -353,12 +476,6 @@ func LoadConfig() (*Config, error) {
 	if token := os.Getenv("AEVITAS_TELEGRAM_TOKEN"); token != "" {
 		cfg.Channels.Telegram.Token = token
 	}
-	if appID := os.Getenv("AEVITAS_FEISHU_APP_ID"); appID != "" {
-		cfg.Channels.Feishu.AppID = appID
-	}
-	if appSecret := os.Getenv("AEVITAS_FEISHU_APP_SECRET"); appSecret != "" {
-		cfg.Channels.Feishu.AppSecret = appSecret
-	}
 	if token := os.Getenv("AEVITAS_WECOM_TOKEN"); token != "" {
 		cfg.Channels.WeCom.Token = token
 	}
@@ -400,4 +517,40 @@ func SaveConfig(cfg *Config) error {
 	}
 
 	return os.WriteFile(ConfigPath(), data, 0644)
+}
+
+func (c *Config) PluginHomeDir() string {
+	if c != nil {
+		if v := strings.TrimSpace(c.Plugins.Home); v != "" {
+			return v
+		}
+	}
+	return filepath.Join(ConfigDir(), "plugins")
+}
+
+func (c *Config) PluginRegistryPath() string {
+	if c != nil {
+		if v := strings.TrimSpace(c.Plugins.Registry); v != "" {
+			return v
+		}
+	}
+	return filepath.Join(c.PluginHomeDir(), "registry.json")
+}
+
+func (c *Config) EnabledChannels() map[string]bool {
+	out := map[string]bool{
+		"telegram":    c != nil && c.Channels.Telegram.Enabled,
+		"wecom":       c != nil && c.Channels.WeCom.Enabled,
+		"interaction": c != nil && c.Channels.Interaction.Enabled,
+	}
+	return out
+}
+
+func SortedStatusKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

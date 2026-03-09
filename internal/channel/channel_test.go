@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 	"github.com/riverfjs/aevitas/internal/bus"
 	"github.com/riverfjs/aevitas/internal/config"
+	sdklogger "github.com/riverfjs/agentsdk-go/pkg/logger"
 )
 
 // ===== BaseChannel 测试 =====
@@ -53,7 +53,7 @@ func TestBaseChannel_IsAllowed_WithFilter(t *testing.T) {
 func TestChannelManager_Empty(t *testing.T) {
 	b := bus.NewMessageBus(10)
 	logger := sdklogger.NewDefault()
-	m, err := NewChannelManager(config.ChannelsConfig{}, b, logger)
+	m, err := NewChannelManager(&config.Config{}, b, logger)
 	if err != nil {
 		t.Fatalf("NewChannelManager error: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestChannelManager_Empty(t *testing.T) {
 
 func TestChannelManager_StartAll_Empty(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	m, _ := NewChannelManager(config.ChannelsConfig{}, b, sdklogger.NewDefault())
+	m, _ := NewChannelManager(&config.Config{}, b, sdklogger.NewDefault())
 
 	ctx := context.Background()
 	m.StartAll(ctx)
@@ -72,7 +72,7 @@ func TestChannelManager_StartAll_Empty(t *testing.T) {
 
 func TestChannelManager_StopAll_Empty(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	m, _ := NewChannelManager(config.ChannelsConfig{}, b, sdklogger.NewDefault())
+	m, _ := NewChannelManager(&config.Config{}, b, sdklogger.NewDefault())
 
 	if err := m.StopAll(); err != nil {
 		t.Errorf("StopAll error: %v", err)
